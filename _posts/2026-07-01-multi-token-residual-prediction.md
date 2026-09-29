@@ -23,7 +23,7 @@ links:
     url: https://modal.com/blog/multi-token-residual-prediction
 ---
 
-> Editor's Note: this guest blog post describes the results of a research collaboration between Modal Research and NYU Shanghai's [HeavyBall Research](https://www.yucheng-lu.me/lab.html). It first appeared on the [Modal blog](https://modal.com/blog/multi-token-residual-prediction).
+> Editor's Note: this guest blog post describes the results of a research collaboration between Modal Research and NYU Shanghai's [HeavyBall Research](https://heavyball-research.github.io/). It first appeared on the [Modal blog](https://modal.com/blog/multi-token-residual-prediction).
 
 <figure>
   <img src="{{ '/assets/posts/2026-07-01-multi-token-residual-prediction/headline-results.png' | relative_url }}" alt="MRP headline results">
