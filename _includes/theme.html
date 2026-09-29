@@ -1,0 +1,63 @@
+<script>
+  (function () {
+    var root = document.documentElement;
+    var preference = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+    var storageKey = 'heavyball-theme';
+    var savedTheme;
+    var button;
+
+    function readTheme() {
+      try {
+        var value = localStorage.getItem(storageKey);
+        return value === 'light' || value === 'dark' ? value : null;
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function applyTheme() {
+      var theme = savedTheme || (preference && preference.matches ? 'dark' : 'light');
+      root.dataset.theme = theme;
+      if (button) {
+        var label = theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode';
+        button.setAttribute('aria-label', label);
+        button.title = label;
+      }
+    }
+
+    // Set the theme before the stylesheet loads to avoid a flash on navigation.
+    savedTheme = readTheme();
+    applyTheme();
+
+    function initializeToggle() {
+      button = document.querySelector('.theme-toggle');
+      if (!button) return;
+      applyTheme();
+      button.hidden = false;
+      // Assign once even if a preview re-runs this script after loading the page.
+      button.onclick = function () {
+        savedTheme = root.dataset.theme === 'dark' ? 'light' : 'dark';
+        try { localStorage.setItem(storageKey, savedTheme); } catch (error) {}
+        applyTheme();
+      };
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initializeToggle, { once: true });
+    } else {
+      initializeToggle();
+    }
+
+    if (preference && preference.addEventListener) {
+      preference.addEventListener('change', applyTheme);
+    } else if (preference && preference.addListener) {
+      preference.addListener(applyTheme);
+    }
+    window.addEventListener('storage', function (event) {
+      if (event.key === storageKey || event.key === null) {
+        savedTheme = readTheme();
+        applyTheme();
+      }
+    });
+  }());
+</script>

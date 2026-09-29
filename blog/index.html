@@ -1,0 +1,19 @@
+---
+layout: default
+title: Blog
+---
+<h1>Posts</h1>
+<hr>
+<ul class="post-list">
+{% for post in site.posts %}
+  <li>
+    <h2><a href="{{ post.url | relative_url }}">{{ post.title }}</a></h2>
+    <p class="meta">
+      <time datetime="{{ post.date | date_to_xmlschema }}">{{ post.date | date: "%b %-d, %Y" }}</time>
+      {% if post.authors %} · {% include authors.html authors=post.authors %}{% endif %}
+      {% if post.external_url %} · <a class="crosspost" href="{{ post.external_url }}">cross-posted ↗</a>{% endif %}
+    </p>
+    {% if post.image %}<a href="{{ post.url | relative_url }}"><img class="thumb{% if post.thumbnail_large %} thumb-large{% endif %}" src="{{ post.image | relative_url }}" alt=""></a>{% endif %}
+  </li>
+{% endfor %}
+</ul>

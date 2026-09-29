@@ -1,0 +1,25 @@
+---
+layout: default
+math: true
+---
+<article class="post{% if page.wrap_tables %} wrap-tables{% endif %}">
+  <header class="post-header">
+    <h1>{{ page.title }}</h1>
+    <p class="meta">
+      <time datetime="{{ page.date | date_to_xmlschema }}">{{ page.date | date: "%b %-d, %Y" }}</time>
+      {% if page.authors %} · {% include authors.html authors=page.authors %}{% endif %}
+    </p>
+    {% if page.tldr %}<p class="tldr">{{ page.tldr }}</p>{% endif %}
+    {% if page.links %}
+    <p class="links">
+      {% for l in page.links %}<a class="pill" href="{{ l.url }}">{{ l.label }}</a>{% endfor %}
+    </p>
+    {% endif %}
+  </header>
+
+  {{ content }}
+
+  {% assign has_equal = false %}
+  {% for a in page.authors %}{% if a.equal %}{% assign has_equal = true %}{% endif %}{% endfor %}
+  {% if has_equal %}<p class="footnote">* Equal contribution.</p>{% endif %}
+</article>

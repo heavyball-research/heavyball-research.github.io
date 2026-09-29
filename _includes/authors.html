@@ -1,0 +1,12 @@
+{%- comment -%}
+Renders "Author A, Author B, and Author C" from a page's `authors:` list.
+Each author: { name: "...", url: "https://..." (optional), equal: true (optional, adds *) }
+Usage: {% include authors.html authors=page.authors %}
+{%- endcomment -%}
+{%- assign n = include.authors | size -%}
+{%- for a in include.authors -%}
+  {%- if a.url -%}<a href="{{ a.url }}">{{ a.name }}{% if a.equal %}*{% endif %}</a>{%- else -%}{{ a.name }}{% if a.equal %}*{% endif %}{%- endif -%}
+  {%- if forloop.last == false -%}
+    {%- if n == 2 %} and {% elsif forloop.rindex == 2 %}, and {% else %}, {% endif -%}
+  {%- endif -%}
+{%- endfor -%}

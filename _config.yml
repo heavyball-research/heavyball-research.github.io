@@ -1,0 +1,40 @@
+title: HeavyBall Research
+description: HeavyBall Research — ML Systems Lab @ NYU Shanghai
+url: "https://heavyball-research.github.io"
+baseurl: ""
+
+github_org: https://github.com/heavyball-research
+
+# --- Markdown / math -------------------------------------------------------
+markdown: kramdown
+kramdown:
+  input: GFM
+  math_engine: mathjax      # $$ ... $$ blocks are passed through untouched for MathJax
+  syntax_highlighter: rouge
+  hard_wrap: false
+
+# --- Posts -----------------------------------------------------------------
+permalink: /blog/:year-:month-:day-:title/
+future: false
+
+defaults:
+  - scope:
+      path: ""
+      type: posts
+    values:
+      layout: post
+
+plugins:
+  - jekyll-feed
+  - jekyll-seo-tag
+  - jekyll-sitemap
+
+feed:
+  path: blog/feed.xml
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - README.md
+  - vendor
+  - node_modules
