@@ -8,7 +8,7 @@ authors:
     url: https://twitter.com/Zeshen_Zhang
   - name: Yucheng Lu
     url: https://twitter.com/_yucheng_lu
-tldr: "TPU-native softmax attention and Gated DeltaNet kernels: up to 744 TFLOP/s, 3.49× faster softmax attention and 3.61× faster GDN prefill on TPU v6e."
+tldr: "TPU-native softmax attention and Gated DeltaNet kernels: up to 744 TFLOP/s, 1.56× faster softmax attention and 3.61× faster GDN prefill on TPU v6e."
 image: /assets/posts/2026-09-20-attention-tpu/gdn_benchmark.png
 thumbnail_large: true
 links:
