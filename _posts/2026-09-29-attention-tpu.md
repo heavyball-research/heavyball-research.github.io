@@ -16,6 +16,8 @@ links:
     url: https://github.com/heavyball-research/flywheel-tpu
 ---
 
+> Editor's Note: We have added more results and updates to Flywheel, including benchmark numbers on TPUv7 Ironwood. Check out our [code](https://github.com/heavyball-research/flywheel-tpu) for the latest.
+
 Attention is all you need. But how much of the hardware can you actually use to run it?
 
 On GPU, attention kernels are a well-studied problem. FlashAttention [1-4] established the fused, tiled, online-softmax formulation that everyone now uses, and every other part of the problem has a well-optimized kernel too: FlashDecode and FlashDecode++ [5] for decode, FlashInfer [6] for serving, and the FLA library [7] for linear attention.
