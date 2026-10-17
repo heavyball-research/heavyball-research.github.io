@@ -11,6 +11,7 @@ We warmly welcome passionate researchers who are excited about the intersection 
 ## Group Updates
 
 - [2026-10] Thanks Amazon for supporting our research through the **2026 Amazon Research Award**!
+- [2026-09] We have released [flywheel-tpu](https://github.com/heavyball-research/flywheel-tpu), a high-performance kernel library for TPUs. Read our story [here](./blog/2026-09-29-attention-tpu)!
 - [2026-09] [Multi-token Residual Prediction](./blog/2026-07-01-multi-token-residual-prediction) is accepted by NeurIPS'26, congrats to the team!
 - [2026-04] Thanks Google for supporting our research through the **2026 Google TPU Research Award**!
 - [2026-04] We are delighted to welcome three new PhD students (Zishuo, Yufeng, and Runyu) to our group!
