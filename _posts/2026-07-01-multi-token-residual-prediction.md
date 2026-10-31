@@ -7,7 +7,7 @@ authors:
     url: https://twitter.com/rchalamala
   - name: Yucheng Lu
     url: https://twitter.com/_yucheng_lu
-tldr: "A tiny module that predicts the residual between denoising steps of a diffusion LM: up to 1.56× lossless speedup in static decoding and up to +16 accuracy points recovered in dynamic decoding."
+tldr: "A lightweight module that predicts the residual between denoising steps of a diffusion LM: up to 1.56× lossless speedup in static decoding and up to +16 accuracy points recovered in dynamic decoding."
 external_url: https://modal.com/blog/multi-token-residual-prediction
 image: /assets/posts/2026-07-01-multi-token-residual-prediction/headline-results.png
 links:
@@ -32,7 +32,7 @@ links:
 
 ## TL;DR
 
-Multi-Token Prediction (MTP) speeds up autoregressive models by predicting several tokens from a single forward pass. We adapt this to diffusion language models by training a module to predict the residual between denoising steps rather than full distributions. This tiny module enables both lossless speedup during static decoding (up to 1.56×) and quality recovery in dynamic decoding (up to +16 accuracy points).
+Multi-Token Prediction (MTP) speeds up autoregressive models by predicting several tokens from a single forward pass. We adapt this to diffusion language models by training a module to predict the residual between denoising steps rather than full distributions. This lightweight module enables both lossless speedup during static decoding (up to 1.56×) and quality recovery in dynamic decoding (up to +16 accuracy points).
 
 **Paper**: <https://arxiv.org/abs/2605.18817>
 
@@ -44,25 +44,25 @@ Multi-Token Prediction (MTP) speeds up autoregressive models by predicting sever
 
 ## Starting from MTP
 
-Autoregressive models generate one token per forward pass, and that's expensive. Lightweight prediction heads like [Medusa](https://arxiv.org/abs/2401.10774), [EAGLE](https://arxiv.org/abs/2401.15077), and [DeepSeek's MTP](https://arxiv.org/abs/2412.19437) predict multiple tokens from hidden states, combined with speculative verification for real speedups.
+Autoregressive models generate one token per forward pass, and that's expensive. Lightweight prediction heads like [Medusa](https://arxiv.org/abs/2401.10774), [EAGLE](https://arxiv.org/abs/2401.15077), and [DeepSeek's MTP](https://arxiv.org/abs/2412.19437) predict multiple tokens from hidden states, combined with speculative verification to accelerate decoding.
 
 We asked whether this approach could work beyond autoregressive models. Diffusion LMs start from masked sequences and gradually unmask high-confidence positions — building in parallelism but creating a tradeoff: unmask too many tokens per step and quality degrades since tokens lack context from others being revealed simultaneously. Most acceleration research operates on this single quality-speed curve.
 
 ## A naïve attempt
 
-The direct approach: train a small head to predict the next step's full log-density from current hidden states, then apply it multiple times. Results collapsed quickly:
+The direct approach: train a small head to predict the next step's full log-density from current hidden states, then apply it multiple times. Accuracy declined sharply as the number of prediction steps increased:
 
 | Method    | K=1  | K=2  | K=3 | K=4 |
 | --------- | ---- | ---- | --- | --- |
 | Naïve MTP | 84.8 | 16.9 | 5.9 | 1.9 |
 
-*GSM8K (0-shot, CoT) accuracy on SDAR-4B. Per-step errors compounded, destroying accuracy beyond step one.*
+*GSM8K (0-shot, CoT) accuracy on SDAR-4B. Per-step errors compounded, sharply reducing accuracy beyond step one.*
 
 ## The main insight
 
 If the full next-step distribution is hard to predict across multiple steps, the question is whether there is an easier target to predict instead. The backbone's output changes only slightly between adjacent denoising steps. Rather than predicting complete distributions from scratch, predict small corrections to already-good predictions.
 
-This stems from the Markov structure of denoising: each step touches only a few positions, so by a Lipschitz argument the predictions at untouched positions can only shift minimally. The signal a small module must learn is inherently low-complexity.
+The motivation is that nearby denoising steps often change only a few positions. Under a Lipschitz smoothness assumption, changes in the input bound changes in the predictions at untouched positions. This motivates learning residual corrections rather than complete distributions.
 
 ## Multi-token Residual Prediction (MRP)
 
@@ -79,7 +79,7 @@ The training objective uses KL divergence on masked positions, comparing the bac
 | Naïve MTP | 84.8 | 16.9 | 5.9  | 1.9  |
 | MRP       | 88.6 | 84.9 | 70.9 | 57.2 |
 
-*GSM8K (0-shot, CoT) accuracy on SDAR-4B. The residual framing dramatically improves multi-step prediction. At K = 2, residual learning leads by 65+ points.*
+*GSM8K (0-shot, CoT) accuracy on SDAR-4B. Residual prediction improves multi-step accuracy in this experiment. At K = 2, residual learning leads by 65+ points.*
 
 ## Applications in inference
 
@@ -87,7 +87,7 @@ DLMs typically run in two regimes: **static denoising** unmasks fixed numbers of
 
 ### Application I: Lossless speedup in static denoising
 
-MRP creates an inference dial with multiple operating points. At one extreme is **speculative decoding**: MRP cheaply proposes tokens, the backbone verifies them in one pass, and positions where they agree are accepted. Positions where the backbone agrees with the draft are accepted; positions where it disagrees are remasked and redone. Verification hidden states seed the next iteration, amortizing costs when acceptance rates are high.
+MRP supports multiple operating points. In **speculative decoding**, MRP proposes tokens and the backbone verifies them in one pass. Positions where the backbone agrees with the draft are accepted; positions where it disagrees are remasked and recomputed. Verification hidden states seed the next iteration, amortizing costs when acceptance rates are high.
 
 | Backbone | GSM8K        | MATH500      | HumanEval    | MBPP         |
 | -------- | ------------ | ------------ | ------------ | ------------ |
@@ -96,7 +96,7 @@ MRP creates an inference dial with multiple operating points. At one extreme is 
 
 *Speculative mode in SGLang. Accuracy (%) followed by throughput speedup. Quality matches the backbone by construction.*
 
-At the other extreme is **direct decoding**: skipping verification and committing MRP's corrected logits directly. This raises the speedup ceiling, and residual predictions prove accurate enough on reasoning tasks that the quality cost is small:
+In **direct decoding**, verification is skipped and MRP's corrected logits are used directly. This increases throughput, with smaller accuracy losses on the evaluated reasoning tasks than on the code tasks:
 
 | Setting             | GSM8K        | MATH500      | HumanEval    | MBPP         |
 | ------------------- | ------------ | ------------ | ------------ | ------------ |
@@ -106,7 +106,7 @@ At the other extreme is **direct decoding**: skipping verification and committin
 
 *Direct decoding on SDAR-8B. Accuracy (%) followed by throughput speedup. Tokens commit without verification. K=1 stays within a point on reasoning at 1.6×; K=2 exceeds 1.8× with larger code-task drops.*
 
-Users choose the operating point based on task requirements. This control only exists when you manage the inference stack directly, not behind closed APIs where the provider fixes the policy.
+Users choose the operating point based on task requirements. Using these options requires access to the inference configuration; hosted APIs may not expose them.
 
 ### Application II: Quality recovery
 
@@ -144,6 +144,6 @@ Several insights emerged:
 
 - **The best depth depends on the mode.** In direct decoding, where MRP outputs are used directly, deeper modules help more. In speculative decoding, verification corrects MRP's mistakes anyway, so a shallower and faster module reaches the same final quality at higher throughput.
 
-- **MRP composes cleanly.** The module provides a primitive that other methods can build on. At its core, MRP is just a cheap, accurate prediction of what the next denoising step would produce. The same module supports both speculative decoding and remasking, adding capabilities rather than competing with existing approaches.
+- **One module supports two decoding modes.** MRP predicts the change in the backbone's output between denoising steps. The same residual predictor can propose tokens for speculative verification or identify tokens to remask.
 
-For diffusion LM work, MRP is easy to attach and provides previously unavailable choices: speed without quality loss, or even greater speed while recovering otherwise-lost quality.
+For diffusion LMs, MRP offers several ways to balance throughput and accuracy: speculative verification in static decoding, direct prediction with an accuracy tradeoff, and remasking to recover accuracy in dynamic decoding.

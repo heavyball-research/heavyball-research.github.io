@@ -6,362 +6,562 @@ authors:
     url: https://twitter.com/David_Bao031126
   - name: Zeshen Zhang
     url: https://twitter.com/Zeshen_Zhang
+  - name: Linkun Chen
+    url: https://github.com/lk-chen
   - name: Yucheng Lu
     url: https://twitter.com/_yucheng_lu
-tldr: "TPU-native softmax attention and Gated DeltaNet kernels: up to 744 TFLOP/s, 1.56× faster softmax attention and 3.61× faster GDN prefill on TPU v6e."
-image: /assets/posts/2026-09-20-attention-tpu/gdn_benchmark.png
+tldr: "TPU-native attention kernels on v6e and v7x: up to 4.14× faster softmax attention than Ragged Paged Attention (RPA-v3) and 1.80× faster than Splash Attention, reaching 81% of peak BF16 throughput on v6e; up to 3.61× faster Gated DeltaNet prefill and 1.56× higher prefill throughput in vLLM serving Qwen3.8-27B, with comparable accuracy."
+image: /assets/posts/2026-09-20-attention-tpu/paper/gdn_kernel.png
 thumbnail_large: true
 links:
   - label: Code
     url: https://github.com/heavyball-research/flywheel-tpu
 ---
 
-> Editor's Note: We have added more results and updates to Flywheel, including benchmark numbers on TPUv7 Ironwood. Check out our [code](https://github.com/heavyball-research/flywheel-tpu) for the latest.
+> Editor's Note: Updated in October 2026 with figures and results from our paper, including TPU v7x (Ironwood). The [code and benchmarks](https://github.com/heavyball-research/flywheel-tpu) are open source.
+
+<nav class="post-toc" aria-labelledby="contents-title" markdown="1">
+<p id="contents-title"><strong>Contents</strong></p>
+
+* Contents
+{:toc}
+
+</nav>
 
 Attention is all you need. But how much of the hardware can you actually use to run it?
 
-On GPU, attention kernels are a well-studied problem. FlashAttention [1-4] established the fused, tiled, online-softmax formulation that everyone now uses, and every other part of the problem has a well-optimized kernel too: FlashDecode and FlashDecode++ [5] for decode, FlashInfer [6] for serving, and the FLA library [7] for linear attention.
+On GPU, attention kernels are a well-studied problem. FlashAttention [[1]](#ref-1), [[2]](#ref-2), [[3]](#ref-3), [[4]](#ref-4) established the fused, tiled, online-softmax approach. FlashInfer [[6]](#ref-6) provides kernels for serving, and the FLA library [[7]](#ref-7) does the same for linear attention. Their success comes from designing around the machine: how it moves data, reuses operands, and overlaps matrix multiplication with other work.
 
-On TPU the hardware is ahead of the software. SemiAnalysis's InferenceX benchmarks put Ironwood at 50% more tokens per dollar than B200, and the same report notes "substantial work still needed across the software stack" [12]. Attention is a large part of that work. A TPU is a different machine in ways that matter for exactly the attention kernels, and the techniques that make FlashAttention and FLA fast on GPU either do not exist on TPU or point in the wrong direction.
+On TPU, there is still a large gap between the hardware's capacity and what attention kernels achieve. In our causal prefill benchmarks on v6e, **RPA-v3**, the Ragged Paged Attention serving kernel, reaches 18–53% of roofline throughput. **Splash Attention**, Google's dense attention kernel, reaches 35–73%. Both already use blocked attention. So where does the rest of the performance go?
 
-In this post we present **Flywheel Attention**, a set of TPU attention kernels covering Softmax Attention (MHA, GQA) and Gated DeltaNet (GDN). We compare against the strongest publicly available TPU kernels we know of:
+<details markdown="1" id="baseline-details">
+<summary>Baselines</summary>
 
-- Softmax attention (MHA, GQA)
-    - **RPA v3 (**[`rpa_v3`](https://github.com/vllm-project/tpu-inference/tree/4420cae/tpu_inference/kernels/ragged_paged_attention/v3)**)** [8]. Ragged Paged Attention v3 is the attention kernel that vLLM's [`tpu-inference`](https://github.com/vllm-project/tpu-inference) backend uses for both prefill and decode. It reads keys and values from a paged KV cache and handles a batch of requests with different lengths in a single call, which makes it the kernel that serving on TPU runs through today.
-    - **Splash Attention (**[`sa`](https://github.com/openxla/tokamax/tree/84e5f36/tokamax/_src/ops/experimental/tpu/splash_attention)**)** [29]. Splash Attention is the blocked flash attention kernel for TPU maintained in OpenXLA's Tokamax, and the kernel that MaxText uses for training. It works on dense, fixed-length sequences with block-sparse masks, so it is the natural reference for the forward and backward passes outside of serving.
-- Gated DeltaNet
-    - **GDN v3 (**[`gdn_v3`](https://github.com/vllm-project/tpu-inference/tree/4420cae/tpu_inference/kernels/gdn/v3)**)** [30]. `gdn_v3` is the Gated DeltaNet Pallas kernel shipped in `tpu-inference` for hybrid models such as Qwen3-Next, covering the chunked prefill pass and the recurrent decode step. As far as we know it is the only GDN kernel for TPU in public use.
+These are concrete TPU implementations, not different model architectures. The comparisons in this post use the versions pinned in the paper:
 
-On TPU v6e, our softmax attention forward reaches 744 TFLOP/s at head dimension 256, 81% of the chip's BF16 peak, and is up to 3.49× faster than `rpa_v3` and up to 1.56× faster than `sa`. Our GDN prefill kernel is up to 3.61× faster than `gdn_v3`. In `tpu-inference`, the kernels speed up end-to-end time for long-context applications such as video understanding and document retrieval.
+- **RPA-v3 (Ragged Paged Attention v3)** [[8]](#ref-8) is the softmax attention kernel in vLLM's `tpu-inference` backend. It reads a paged key/value cache and handles sequences of different lengths in the same batch, covering prefill and decode. We use [`tpu-inference` at commit `4420cae`](https://github.com/vllm-project/tpu-inference/tree/4420cae/tpu_inference/kernels/ragged_paged_attention/v3).
+- **Splash Attention** [[29]](#ref-29) is the dense, blocked attention kernel maintained in OpenXLA's Tokamax and used by MaxText for training. It operates on dense sequences and supports block-sparse masks. We use [Tokamax at commit `84e5f36`](https://github.com/openxla/tokamax/tree/84e5f36/tokamax/_src/ops/experimental/tpu/splash_attention).
+- **GDN-v3** [[30]](#ref-30) is the fused causal convolution and Gated DeltaNet prefill kernel in [`tpu-inference` at commit `4420cae`](https://github.com/vllm-project/tpu-inference/tree/4420cae/tpu_inference/kernels/gdn/v3). Gated DeltaNet is the attention mechanism; GDN-v3 is the baseline implementation of it.
 
-*Note: throughout this post, "GPU" means NVIDIA Hopper (sm90) and later, and "TPU" means TPU v6e unless a generation is named. The constraints in Section 2 hold across TPU generations, so the analysis carries over to earlier chips and to Ironwood with the tile and MXU sizes adjusted.*
+The application comparison uses vLLM at commit `51da0ca` with `tpu-inference` at `4420cae`. An environment switch selects the kernels inside the same build. These measurements describe those versions, rather than whichever versions the repositories contain today.
 
-## 1. How attention runs on a GPU today
+</details>
 
-We start from what the two kinds of attention compute, and how GPU kernels compute them fast. We keep the notation to the minimum and drop constants like the gates, scale factors and masks. The full formulations are in the FlashAttention paper [1] for softmax attention and in [10, 11] for Gated DeltaNet.
+The answer is in the work between the matmuls: loading operands, reducing and rescaling scores, and waiting for dependent operations. The GPU techniques above solve these problems around a different machine. On TPU, we have to revisit the layout, the arithmetic, and the schedule together.
 
-**Softmax attention.** For one head, query $Q$, key $K$ and value $V$ have one row per token, and
+**Flywheel Attention** applies that reasoning to both softmax attention and Gated DeltaNet. The result is up to 81% of peak BF16 throughput on v6e, softmax speedups of up to 4.14× over RPA-v3 and 1.80× over Splash across v6e and v7x, and up to 3.61× faster GDN prefill. In vLLM serving Qwen3.8-27B, the kernels improve prefill throughput by up to 1.56×. The rest of this post follows the three bottlenecks that led us there.
 
-$$
-P = \text{softmax}(Q K^\top), \qquad O = P V
-$$
+## Background
 
-FlashAttention [1] never builds the full $P$ matrix. It walks over blocks of $K$ and $V$ and keeps three running values per query row: the largest score so far $m$, the sum of exponentiated scores $l$, and the output accumulator $o$. When a block arrives with scores $s$,
+**Softmax attention** reads queries, keys, and values, computes attention weights, and uses those weights to mix the values. FlashAttention avoids building the full attention matrix in memory: it visits blocks of keys and values while keeping a running output. Each block contains two matrix products with softmax operations between them.
 
-$$
-m' = \max(m, \max s), \qquad p = e^{s - m'}, \qquad l \leftarrow e^{m - m'}\, l + \textstyle\sum p, \qquad o \leftarrow e^{m - m'}\, o + p\,V
-$$
+<details markdown="1" id="softmax-background">
+<summary>Softmax Attention: Blockwise Computation</summary>
 
-and the output is $o / l$ at the end. The factor $e^{m - m'}$ is the rescale: whenever a block raises the running max, everything accumulated so far is rescaled to incorporate that max value. 
-
-On GPU this loop has been tuned for four generations. FlashAttention-2 [2] split the work across warps so that none waits on another. FlashAttention-3 [3] separated the threads that load tiles from the threads that compute on them, and let two compute groups alternate so that one's softmax overlaps the other's matmuls. FlashAttention-4 [4] skips the rescale when the max barely moves. Serving kernels such as FlashInfer [6] walk a paged, ragged KV cache with plain pointer arithmetic. 
-
-**Gated DeltaNet.** GDN [10] replaces the growing KV cache with a fixed-size state $S$ per head, which every token updates with a decay and a write strength $\beta$. Kernels process chunks of $C = 64$ tokens at once [11]. For one chunk, with $Q$, $K$, $V$ its rows and the gates folded in:
+We use the paper's notation. For one head, $\mathbf{Q},\mathbf{K},\mathbf{V}\in\mathbb{R}^{T\times D}$, where $T$ is the sequence length and $D$ the head dimension. Softmax attention computes
 
 $$
-A_{kk} = \text{lower}(K K^\top), \qquad A_{qk} = \text{lower}(Q K^\top), \qquad V_\text{new} = (I + A_{kk})^{-1}(\ldots) - (\ldots)\,S
+\mathbf{P}=\operatorname{softmax}(\mathbf{Q}\mathbf{K}^{\top}),
+\qquad \mathbf{O}=\mathbf{P}\mathbf{V}.
 $$
 
+Here $\mathbf{P}\in\mathbb{R}^{T\times T}$ and $\mathbf{O}\in\mathbb{R}^{T\times D}$. Scaling and masks are omitted for clarity. Multi-head attention (MHA) gives each query head its own key/value head; grouped-query attention (GQA) shares key/value heads across query heads. We write their counts as $H\_q$ and $H\_{kv}$.
+
+FlashAttention [[1]](#ref-1) never materializes the full $\mathbf{P}$. For one query row, online softmax keeps a scalar running maximum $m$, a scalar normalization sum $l$, and an output accumulator $\mathbf{o}\in\mathbb{R}^{1\times D}$. For a block of $B$ keys, let $\mathbf{s}\in\mathbb{R}^{1\times B}$ be its scores and $\mathbf{V}\_b\in\mathbb{R}^{B\times D}$ its values. The update is
+
 $$
-O = Q S + A_{qk} V_\text{new}, \qquad S \leftarrow S + K^\top V_\text{new}
+\begin{aligned}
+m' &= \max(m,\max_j s_j),\\
+\mathbf{p} &= e^{\mathbf{s}-m'},\qquad r=e^{m-m'},\\
+l &\leftarrow r l+\textstyle\sum_j p_j,\\
+\mathbf{o} &\leftarrow r\mathbf{o}+\mathbf{p}\mathbf{V}_b.
+\end{aligned}
 $$
 
-where $\text{lower}$ keeps the lower-triangular part and the elided terms are $V$ and $K$ with the gates applied. Everything here is a matmul except the inverse of a $64 \times 64$ lower-triangular matrix $(I + A_{kk})^{-1}$. Before the delta rule, the qkv projection (width $\text{dim} = 2 n_{kq} d_k + n_v d_v$) goes through a 4-tap causal convolution along the token axis, and $Q$ and $K$ are l2-normalized. A layer has $n_{kq}$ query/key heads shared by $n_v$ value heads. 
+We then set $m\leftarrow m'$ and return $\mathbf{o}/l$ after the last block. The factor $r$ rescales earlier contributions whenever the running maximum increases. That stabilizes the exponentials, but adds reductions, rescaling, and dependencies between the matrix products.
 
-The GPU kernels for this loop live in the FLA library [7]. They do the triangular inverse by forward substitution on the CUDA cores and the convolution, gates and normalizations as ordinary elementwise code, all of it a rounding error next to the matmuls on a GPU.
+</details>
 
-## 2. Why the GPU playbook does not transfer to TPU
+**Gated DeltaNet (GDN)** [[10]](#ref-10) replaces the growing key/value cache with a fixed-size state. Each token updates that state and reads an output from it. For prefill, grouping tokens into chunks turns most of the recurrence into matrix products [[11]](#ref-11). The difficult operation in the middle is a triangular inverse. Before the recurrence, the layer also applies a short causal convolution, an activation, and query/key normalization.
 
-Everything in the previous section rests on four things a GPU provides:
+<details markdown="1" id="gdn-background">
+<summary>Gated DeltaNet: Chunked Computation</summary>
 
-- Loads that pull strided tiles out of a tensor in whatever layout it already has, through TMA or plain pointer arithmetic [18];
-- Tensor cores that read both operands with every instruction, from shared memory, registers or tensor memory, with no separate weight-load step [28];
-- Vector units that run concurrently with the tensor cores [3];
-- Many resident warps, and a hardware warp scheduler that switches among them to hide latency [13, 14, 15].
+Following the paper, queries and keys are row vectors $\mathbf{q}\_t,\mathbf{k}\_t\in\mathbb{R}^{1\times d\_k}$, values are $\mathbf{v}\_t\in\mathbb{R}^{1\times d\_v}$, and the state is $\mathbf{S}\_t\in\mathbb{R}^{d\_k\times d\_v}$. The update and output are
 
-A TPU TensorCore has none of these, or at least, not in the same form. It is an in-order VLIW machine: a single-threaded scalar unit fetches VLIW bundles, executes their scalar slots and forwards the rest to the vector and matrix units. A separate asynchronous DMA unit moves data between HBM and VMEM [19, 20]. Vector and matrix work does issue in parallel, but only as far as the compiler packed it into the same bundles. The four GPU capabilities above become four constraints for TPUs, and each one shows up directly in an attention kernel.
+$$
+\begin{aligned}
+\mathbf{S}_t &= \mathbf{S}_{t-1}
++\beta_t\mathbf{k}_t^\top(\mathbf{v}_t-\mathbf{k}_t\mathbf{S}_{t-1}),\\
+\mathbf{o}_t &= \mathbf{q}_t\mathbf{S}_t.
+\end{aligned}
+$$
 
-**Layout is not the kernel's to choose.** From TPU v2 through v6e a vector register holds an 8×128 tile of 32-bit values, 16×128 once BF16 is packed two rows per word, and the last two dimensions of any array are the ones that land on it. Ironwood widens the register to 16×256 [20, 22, 27]. The last two dimensions of a block shape must be divisible by 8 and 128, or equal the full array [22]. In HBM, XLA stores BF16 arrays in 8×128 tiles with pairs of rows packed into one 32-bit word [21], which is why a DMA window into an activation starts on an 8-row grid.
+The scalar $\beta\_t$ controls the update strength. The residual in parentheses corrects the state's prediction of the current value. As in the paper's background, we omit the decay gate, which scales the previous state before the update.
 
-**Weight-stationary MXUs.** A TensorCore holds a small number of MXUs: four 128×128 systolic arrays on v4, v5e and v5p, two 256×256 arrays on v6e, and two 256×256 arrays on Ironwood [20, 23]. Each MXU takes a matmul in two steps: push the right-hand operand into the array, then stream the left-hand rows through it and pop the results from a FIFO [24, 25]. Pushes, matmuls and pops are all slots in the core's single instruction stream, so the compiler's schedule serializes them [19, 25]. 
+Within a chunk of $C=64$ tokens, stack the rows into $\mathbf{Q},\mathbf{K}\in\mathbb{R}^{C\times d\_k}$ and $\mathbf{V}\in\mathbb{R}^{C\times d\_v}$. Let $\boldsymbol{\beta}=\operatorname{diag}(\beta\_1,\ldots,\beta\_C)$ and define
 
-**A narrow vector side.** In addition to MXU, we have a VPU for elementwise work, an EUP for transcendentals such as exp, and an XLU for transposes and permutes [22, 24, 26]. Each bundle has a fixed number of slots per unit [19, 20]. The vector math, loads and stores fill it and every register spill compete for the same few slots of a single instruction stream. 
+$$
+\begin{aligned}
+\mathbf{A}_{kk}&=\operatorname{tril}_{-1}(\boldsymbol{\beta}\mathbf{K}\mathbf{K}^\top),\\
+\mathbf{A}_{qk}&=\operatorname{tril}_{0}(\mathbf{Q}\mathbf{K}^\top).
+\end{aligned}
+$$
 
-**No fine-grained hardware scheduler.** Mosaic, the compiler behind Pallas on TPU, performs layout inference and lowering and emits MXU, VPU, EUP and XLU work in program order [26, 27]. The LLO scheduler then reorders independent instructions within a basic block and packs them into bundles [22, 26]. The compiler can overlap some vector and matrix work, but that overlap is limited by the dependency graph the kernel exposes. Within one step of an attention loop, `QK` feeds exp and exp feeds `PV`, so the independent work that could fill the gaps sits in other steps, and runtime loop boundaries can still drain the pipeline. Any overlap beyond that is the kernel's to write.
+Both matrices have shape $C\times C$. The first mask keeps the strictly lower triangle; the second includes the diagonal. With $\mathbf{S}$ the state entering the chunk,
 
-Table 1 takes one technique from Section 1 for each constraint and shows where it breaks.
+$$
+\begin{aligned}
+\mathbf{V}_{\mathrm{new}} &=(\mathbf{I}+\mathbf{A}_{kk})^{-1}
+\boldsymbol{\beta}(\mathbf{V}-\mathbf{K}\mathbf{S}),\\
+\mathbf{O}&=\mathbf{Q}\mathbf{S}+\mathbf{A}_{qk}\mathbf{V}_{\mathrm{new}},\\
+\mathbf{S}&\leftarrow\mathbf{S}+\mathbf{K}^\top\mathbf{V}_{\mathrm{new}}.
+\end{aligned}
+$$
 
-**Table 1. One GPU attention technique per constraint, and why it fails on TPU.**
+Here $\mathbf{V}\_{\mathrm{new}},\mathbf{O}\in\mathbb{R}^{C\times d\_v}$ and $\mathbf{I}$ is the $C\times C$ identity. Decay factors are again omitted. The inputs here are after convolution, SiLU, and query/key normalization.
 
-| Constraint | What works on GPU | Why it fails on TPU |
-| --- | --- | --- |
-| Layout is not the kernel's to choose | The kernel reads Q, K, V in the model's own layout, and a ragged sequence starts at any token via TMA or pointer arithmetic. | Any other layout could easily be a full HBM pass outside the kernel, and a sequence cannot start off the 8-row grid.  |
-| Weight-stationary MXUs | Tensor cores are fed from registers by many warps; operand reuse can reduce data movement, with mechanisms that depend on the GPU architecture and MMA instruction. | Every matmul begins with a push, and an operand pushed twice, or transposed, spends MXU slots nothing else can use. Reusing the resident right-hand operand amortizes the MXU weight-push cost across matmuls. |
-| A narrow vector side | Softmax and the delta rule's solve, convolution and gates run as ordinary vector code on CUDA cores and SFUs, hidden behind the matmuls. | The vector slots saturate first.  |
-| No fine-grained hardware scheduler | Concurrent warpgroups, interleaved by the warp scheduler, so one group's softmax overlaps another's matmuls (FA3). | One instruction stream. The compiler can reorder independent instructions, but overlap is limited by the program's dependency graph; runtime loop boundaries can still drain the pipeline. |
+There are two useful kinds of independence in these equations. The local matrices and their inverse depend only on the chunk's inputs. The value updates, outputs, and state update also need the incoming recurrent state. That distinction will matter when we build the pipeline.
 
-## 3. The Flywheel kernels
+</details>
 
-The Flywheel kernels are our answer to the four rows of Table 1, together with the observation that one answer per row serves both forms of attention. Table 2 summarizes how Flywheel Attention addresses the four constraints on TPUs.
+These mechanisms look different, but both alternate matrix products with work that can keep the matrix units waiting. That is the shared problem Flywheel addresses.
 
-**Table 2. An overview of Flywheel optimizations.**
+## TPU Architecture and Attention Bottlenecks
 
-| TPU Constraint | Softmax attention (MHA, GQA) | Gated DeltaNet |
-| --- | --- | --- |
-| Layout is not the kernel's to choose | **Tokens on sublanes**: one head per block, ragged sequences snapped to the 8-row grid with an output copy. | **Native layout in, packed output out**: `[T, dim]` BF16 in, `[T, n_v·d_v]` out, no XLA retile or upcast. |
-| Weight-stationary MXUs | Long query blocks stream through each pushed key and value tile, and the fragment pipeline keeps the next push in flight. | **Push each weight once**: $K^\top$ shared by $A_{kk}$ and $A_{qk}$, $V_\text{new}$ shared by output and state update, they are never transposed. We issue two heads per push. |
-| A narrow vector side | **Static-anchor softmax**: no running max, no rescale, one check per block; scores in log2 units. | **Vector work onto the MXU**: triangular inverse as 8 BF16 matmuls, convolution as one matmul against a constant selector, silu and l2norm at one EUP push each. |
-| No fine-grained hardware scheduler | **A pipeline across fragments**: fully unrolled, spanning every head in the block. | **Fill the gaps**: other chunks' matmuls emitted into the inverse's 200-cycle latency gaps. |
+GPU attention optimizations do not transfer directly because the TPU changes the cost of operand reuse, vector work, and scheduling [[19]](#ref-19), [[20]](#ref-20), [[24]](#ref-24). The units can execute concurrently; the challenge is giving them useful work at the right time.
 
-### 3.1 Softmax Attention (MHA and GQA)
+### Data Layout and Matrix Operand Reuse
 
-![q_layout.png]({{ '/assets/posts/2026-09-20-attention-tpu/q_layout.png' | relative_url }})
+A TPU matrix unit (MXU) is weight-stationary: it loads the right-hand operand into a systolic array, then reuses it as left-hand rows stream through. Loading that operand costs something even if the data is already on chip. A layout that leaves padding in the tile, or allows only a few query rows per load, wastes matrix capacity.
 
-**Figure 1.** Tokens on sublanes (ours, left) vs. heads on sublanes (rpa_v3, right): each head becomes a dense [T, D] tile, and 16 tokens × 4 heads take 4 MXU pushes instead of 16.
+On GPUs, attention kernels organize loads and work across threads around GPU tensor-core instructions. TPU register tiling and the MXU's separate operand-loading step make a different organization useful. Optimizing just the matmul is insufficient if the surrounding model must first upcast or retile its inputs in high-bandwidth memory (HBM).
 
-**Tokens on sublanes.** The first problem is the layout constraint. Omitting the batch dimension, an attention input is a `[T, H, D]` array of sequence length, heads and head dimension. $D$ goes on lanes in any sensible layout, so the one real choice is what goes on sublanes. `rpa_v3` keeps the model's order and puts heads there. Tokens then sit on a leading axis, where a ragged sequence can start at any token, but every query block carries all the heads of its tokens, and so do its $m$, $l$ and $o$. We see the issue with this design choice is that the more heads on a chip, the shorter the blocks, and every extra block re-reads $K$ and $V$. We instead put tokens on sublanes, as `[H, T, D]`and let the “reshape” fuse with the RoPE after. A `[T, D]` tile is exactly an MXU operand, every DMA moves whole tiles, and a block belongs to a single head, so its length no longer depends on how many heads the model has. GQA needs no stacking of query heads either: query head $h$ simply reads KV head within that group.
+### Non-matrix Work on the Critical Path
 
-![ragged_blend.png]({{ '/assets/posts/2026-09-20-attention-tpu/ragged_blend.png' | relative_url }})
+TPUs have much more matrix throughput than vector throughput. Softmax's maximum reductions and accumulator rescales sit between its two matrix products. GDN's forward substitution introduces a chain of dependent row updates. Neither looks large in a FLOP count, but either can hold up the MXU.
 
-**Figure 2.** Seq r's window snaps from row 13 down to row 8. Rows 8–12 of seq r − 1 are copied back from block k − 1's output stage in VMEM before the output DMA.
+Even a GPU optimization aimed at reducing this work can have a different outcome on TPU. FlashAttention-4 [[4]](#ref-4) conditionally skips rescaling. In our TPU implementation, it still needs the per-fragment maximum and rescale-factor computation, and its branch adds register pressure. Saving arithmetic alone does not guarantee a faster kernel.
 
-We pay for this in two places.
+### Exposing Work for Compiler Scheduling
 
-- Inside the kernel, a sequence's DMA window can only start on the 8-row grid. We snap each window's start down to a multiple of 8, so up to 7 rows of the previous sequence ride along at the top of its first block. Before the output DMA we copy those rows back from the previous block's output, which double buffering keeps in VMEM, and the block lands directly in its final place in the packed output. This is 1.9–3.0× faster on ragged batches than a padded write followed by a gather.
-- Outside the kernel, the layout costs nothing. Q, K and V come out of the QKV projection on the hidden states, and XLA writes them in `[H, T, D]` directly; the per-head norms and K's RoPE read and write that layout. Q's RoPE moves into the kernel and is applied in FP32 to each Q tile after its DMA lands. The output projection reads the kernel's `[H, T, D]` output as is, so the compiled HLO has no transpose or copy between the hidden states and the output projection.
+FlashAttention-3 [[3]](#ref-3) combines asynchronous matrix operations with pipelining across GPU warpgroups. A TPU TensorCore instead coordinates its matrix, vector, and specialized units through one instruction stream. The compiler can overlap independent operations, but it cannot overlap a dependency chain with itself.
 
-**Static-anchor softmax.** Online softmax rescales the whole accumulator whenever the running max moves. FlashAttention-4 skips the rescale when the max barely moves, but on TPU tracking and comparing the max on every fragment cost as much as the rescales it saved and spilled our pipeline to VMEM. We propose using a static-anchor version. Our key insight is that the anchor does not have to be the max, only close enough that nothing overflows. So each row fixes its anchor at the max of its first fragment and never moves it:
+Within a softmax fragment, scores feed exponentials, which feed the output product. In GDN, the inverse has dependent products and the recurrent state links chunks. The independent work is in other fragments and chunks. The kernel must expose it across the boundaries that would otherwise hide it from the scheduler.
+
+## Flywheel
+
+The three challenges suggest three connected changes: make each operand load do more work, reduce the vector operations around the matmuls, and interleave independent computation. We apply each idea to both attention mechanisms.
+
+### Layout and Operand Reuse
+
+For softmax attention, the first choice is what to put on the TPU's register sublanes. RPA-v3 puts heads there. Every query block then carries all the heads of its tokens, together with their accumulators. The more heads on a chip, the shorter the blocks, and every extra block re-reads keys and values. Under MHA, padding also leaves half the BF16 rows unused.
+
+We instead put **tokens on sublanes**, with one head per tile. Each tile is a dense matrix, its query length no longer shrinks with the head count, and each loaded key or value operand serves more query rows. GQA follows the same organization: each query head reads its shared key/value head. The surrounding projections produce and consume this layout directly, so the gain does not require a separate HBM conversion.
+
+<figure class="figure-compact">
+  <a href="{{ '/assets/posts/2026-09-20-attention-tpu/paper/layout.pdf' | relative_url }}"><img src="{{ '/assets/posts/2026-09-20-attention-tpu/paper/layout.png' | relative_url }}" alt="Per-head token tiling and on-chip handling of ragged sequence boundaries." width="1800" height="1462" loading="lazy"></a>
+  <figcaption>Figure 1. Top: RPA-v3 places heads on sublanes; Flywheel packs tokens from one head, removing the MHA padding and allowing longer query tiles. Bottom: a sequence beginning at row 13 uses an aligned window starting at row 8. Rows 8–12 are restored from the previous VMEM buffer before the output DMA.</figcaption>
+</figure>
+
+GDN's chunks are smaller, so we find reuse across products instead. The products that build its two local matrices share the same keys. Later, the output contribution and state update share the newly computed values. **Stacking products with the same right operand turns four separate matmuls into two larger ones.** Each operand is loaded once for both uses.
+
+<details markdown="1" id="operand-reuse">
+<summary>GDN Shared-Operand Products</summary>
+
+Using the chunk notation above,
+
+$$
+\begin{bmatrix}\boldsymbol{\beta}\mathbf{K}\\\mathbf{Q}\end{bmatrix}\mathbf{K}^\top
+=
+\begin{bmatrix}\boldsymbol{\beta}\mathbf{K}\mathbf{K}^\top\\\mathbf{Q}\mathbf{K}^\top\end{bmatrix}.
+$$
+
+After triangular masking, this gives $\mathbf{A}\_{kk}$ and $\mathbf{A}\_{qk}$ with one load of $\mathbf{K}^\top$. The state increment and intra-chunk output similarly share $\mathbf{V}\_{\mathrm{new}}$:
+
+$$
+\begin{bmatrix}\mathbf{K}^\top\\\mathbf{A}_{qk}\end{bmatrix}\mathbf{V}_{\mathrm{new}}
+=
+\begin{bmatrix}\mathbf{K}^\top\mathbf{V}_{\mathrm{new}}\\\mathbf{A}_{qk}\mathbf{V}_{\mathrm{new}}\end{bmatrix}.
+$$
+
+These products preserve the paper's state orientation: $\mathbf{S}\in\mathbb{R}^{d\_k\times d\_v}$, so the state increment is $\mathbf{K}^\top\mathbf{V}\_{\mathrm{new}}$.
+
+</details>
+
+The boundary around the kernel matters too. GDN-v3's wrapper upcasts and retiles the projection output. Flywheel takes the BF16 projection layout directly and writes the layout consumed by the next projection. In the paper's 8K-token ablation, coordinated layouts alone give a 1.52–1.68× speedup.
+
+### Reducing Vector Work
+
+Better reuse gives the MXU more useful work per load. Now consider what happens between those products.
+
+**For softmax, stop repeatedly updating the anchor.** Online softmax rescales the whole accumulator whenever its running maximum increases. But softmax does not require that reference to be the maximum: subtracting any fixed value multiplies all the weights by a common factor, which cancels in the final normalization. The reference only has to keep the arithmetic within range.
+
+Flywheel starts each row's anchor at the maximum of its first key tile and holds it fixed on the fast path. A later score could still be much larger. Rather than recompute a maximum on every fragment, we **check the sum already being accumulated**. The weights are nonnegative, so that sum bounds every individual weight. One comparison per row at the end of a key/value block checks the range budget. A failed block is replayed with guarded anchor updates in the same launch.
+
+<details markdown="1" id="checked-anchor">
+<summary>Checked Static Anchor and Guarded Replay</summary>
+
+For a query row with scalar anchor $a$, scores $\mathbf{s}$, normalization sum $l$, and output accumulator $\mathbf{o}$, the fast path computes
+
+$$
+\begin{aligned}
+\mathbf{p}&=e^{\mathbf{s}-a},\\
+l&\leftarrow l+\textstyle\sum_j p_j,\\
+\mathbf{o}&\leftarrow\mathbf{o}+\mathbf{p}\mathbf{V}_b.
+\end{aligned}
+$$
+
+The final $\mathbf{o}/l$ cancels the common factor $e^{-a}$ in exact arithmetic. Unlike online softmax, no fragment updates the maximum or rescales the accumulators on this path.
+
+The paper checks $l\le\Lambda$ after each key/value block. Since every $p\_j$ is nonnegative, $p\_j\le l$ for every key seen so far. A conservative sum therefore certifies the weights without inspecting the scores again. The comparison also fails for NaN and infinity.
+
+Let $V\_{\max}$ bound the absolute entries of $\mathbf{V}$, and let $F$ be a conservative range limit supported by the operands and FP32 accumulators. For sequence length $T$, a sufficient condition for the guarded score margin $\tau\ge0$ is
+
+$$
+T e^\tau\max(1,V_{\max})\le F e^{-\delta},
+$$
+
+where $\delta\ge0$ reserves numerical headroom. A conservative fast-path acceptance bound is $\Lambda=e^\tau$. In exact arithmetic, an accepted sum bounds every output entry by $lV\_{\max}$. The implementation must also account for its operand casts and reductions.
+
+For recovery, the kernel saves the anchor and accumulators on entry to each key/value block. If the check fails, it restores that state and recomputes **only the failing block**. The saved state includes all contributions before that block. Replay also completes the block's last output product and clears its pending weights, so the pipeline does not count that product twice. Before each fragment's exponentiation, the guarded path computes its maximum $m$ and chooses
+
+$$
+\begin{aligned}
+a'&=\operatorname{where}(m-a>\tau,m,a),\\
+r&=e^{a-a'},\\
+l&\leftarrow r l,\qquad \mathbf{o}\leftarrow r\mathbf{o},\qquad a\leftarrow a'.
+\end{aligned}
+$$
+
+Rescaling both accumulators preserves their ratio. After an anchor update, each score is at most $\tau$ above the anchor, giving the range bound above. The first key tile must contain a valid key for every query row; fully masked later fragments contribute zero. The softmax expression is unchanged in exact arithmetic, with ordinary floating-point error in the implementation.
+
+Related fixed-anchor paths include FlashDecoding++ [[5]](#ref-5) and Splash Attention's caller-supplied `max_logit_const` [[29]](#ref-29). Flywheel chooses the anchor internally, checks its accumulated sum, and recovers inside the same launch, without offline calibration or a constant supplied by the caller.
+
+</details>
+
+In the paper's 32K-token v6e ablation, replacing online softmax with this checked anchor raises pipelined throughput from **582 to 722 TFLOP/s**. The gain comes from removing recurring work and its register state, not just skipping occasional rescales.
+
+**For GDN, move the inverse onto the MXU.** GDN-v3 computes the triangular inverse with dependent forward-substitution updates on the vector unit. The inverse can also be expressed as matrix products, but applying a polynomial to the entire chunk can create large intermediate values and cancellation.
+
+Flywheel uses a hierarchy: invert the **4×4** diagonal blocks, then merge four at a time, **4 → 16 → 64**. This builds on prior matrix-based inversion [[9]](#ref-9), with a decomposition designed for BF16 operands and FP32 accumulation. It completes the 64-token inverse in **eight matmuls**, avoiding high powers of the full-chunk matrix.
+
+<figure class="figure-compact">
+  <a href="{{ '/assets/posts/2026-09-20-attention-tpu/paper/vector.pdf' | relative_url }}"><img src="{{ '/assets/posts/2026-09-20-attention-tpu/paper/vector.png' | relative_url }}" alt="Hierarchical triangular inversion and causal convolution expressed as matrix products." width="1800" height="1441" loading="lazy"></a>
+  <figcaption>Figure 2. Top: invert the 4×4 diagonal blocks, then merge four at a time, 4 → 16 → 64, using eight BF16 matmuls in total. Bottom: express the four-tap causal convolution as one product against a constant selector matrix; the preprocessing details are collected later in the post.</figcaption>
+</figure>
+
+<details markdown="1" id="hierarchical-inverse">
+<summary>Hierarchical Triangular Inversion</summary>
+
+Write the chunk's unit lower-triangular matrix as $\mathbf{U}=\mathbf{I}+\mathbf{A}\_{kk}$, as in the paper. In each 4×4 diagonal block, the strictly lower-triangular part $\mathbf{L}$ satisfies $\mathbf{L}^4=0$. Therefore
+
+$$
+(\mathbf{I}+\mathbf{L})^{-1}
+=(\mathbf{I}-\mathbf{L})(\mathbf{I}+\mathbf{L}^2).
+$$
+
+This takes two products: one for $\mathbf{L}^2$, one for the factored inverse. The independent diagonal blocks are handled together.
+
+At a merge level, decompose $\mathbf{U}=\mathbf{J}+\mathbf{E}$, where $\mathbf{J}$ contains four diagonal blocks and $\mathbf{E}$ their strictly lower off-diagonal blocks. The previous level already provides $\mathbf{J}^{-1}$. Define $\mathbf{N}=\mathbf{E}\mathbf{J}^{-1}$. It is strictly lower triangular in four-block form, so $\mathbf{N}^4=0$, and
+
+$$
+\mathbf{U}^{-1}
+=\mathbf{J}^{-1}(\mathbf{I}-\mathbf{N})(\mathbf{I}+\mathbf{N}^2).
+$$
+
+Each merge takes three products:
+
+1. Form $\mathbf{N}=\mathbf{E}\mathbf{J}^{-1}$.
+2. Stack $\mathbf{J}^{-1}$ and $\mathbf{N}$ to form both $\mathbf{J}^{-1}\mathbf{N}$ and $\mathbf{N}^2$ with a shared right operand.
+3. Multiply $(\mathbf{J}^{-1}-\mathbf{J}^{-1}\mathbf{N})$ by $(\mathbf{I}+\mathbf{N}^2)$.
+
+Two products at the base and three at each of two merge levels give $2+3+3=8$. BF16 operands with FP32 accumulation produce an approximate inverse in floating-point arithmetic. On the paper's repeated-key test at $C=64$, its maximum absolute error relative to FP64 is $9\times10^{-3}$; the application results below evaluate model accuracy.
+
+</details>
+
+### Overlapping Independent Computation
+
+Reducing the vector work still leaves latency. A softmax fragment has to compute its scores before its exponentials; the inverse has to wait for one product before issuing the next. Running each chain straight through leaves the MXU idle between dependent steps.
+
+The useful independence is just outside each chain.
+
+**In softmax, pipeline fragments within a head.** A fragment's scores and exponentials do not depend on the previous fragment's output product. Flywheel interleaves them and keeps the fragments in one compiler basic block, so the scheduler can overlap matrix and vector work. The pipeline also continues across head boundaries.
+
+RPA-v3 interleaves work across KV heads. Under GQA with high tensor parallelism, a device may have only one KV head, leaving no head-level work to overlap. Flywheel's overlap comes from consecutive fragments of the same head, so it survives that case. With the static anchor held fixed, this pipeline raises the 32K-token ablation from **521 to 722 TFLOP/s**.
+
+**In GDN, overlap chunk-local work with recurrent work.** The inverse depends only on a chunk's own inputs. It does not need the incoming recurrent state. While the first chunk's inverse runs, we can build the second chunk's local matrices. While the second inverse runs, we can compute the first chunk's state-dependent output and update. The recurrence stays ordered, but independent work fills the inverse's latency gaps.
+
+<figure class="figure-compact">
+  <a href="{{ '/assets/posts/2026-09-20-attention-tpu/paper/schedule.pdf' | relative_url }}"><img src="{{ '/assets/posts/2026-09-20-attention-tpu/paper/schedule.png' | relative_url }}" alt="Schedules overlapping softmax fragments and independent GDN chunk computations." width="1800" height="1358" loading="lazy"></a>
+  <figcaption>Figure 3. Top: overlap each softmax fragment’s QK and exponentials with the preceding fragment’s PV. Bottom: fill the gaps between GDN inverse products with independent work from neighboring chunks. Bar lengths are schematic.</figcaption>
+</figure>
+
+<details markdown="1" id="fragment-schedule">
+<summary>Fragment Pipelining</summary>
+
+For one head, the software pipeline has the following schematic order. `weights` uses the checked static-anchor path; the range checks and guarded replay are omitted here.
 
 ```python
-# Online softmax: rescale on every fragment
-m_new = maximum(m, rowmax(s))
-alpha = exp(m - m_new)
-l = alpha * l + rowsum(exp(s - m_new))
-o = alpha * o + exp(s - m_new) @ v
+p = weights(scores(fragment[0]))
+for i in range(1, num_fragments):  # fully unrolled
+    s_next = scores(fragment[i])  # next QK product
+    accumulate_output(p, fragment[i - 1].V)  # previous PV product
+    p = weights(s_next)          # next exponentials
+accumulate_output(p, fragment[-1].V)
 ```
 
-```python
-# Static anchor: fast path, no rescale
-p = exp2(s - anchor)
-l = l + rowsum(p)
-o = o + p @ v
-```
+These are operations exposed to the compiler, rather than a claim that all three execute simultaneously. Their independent matrix and vector instructions can overlap within the basic block. The final output product drains the pipeline. This independence also exists with online softmax; the fixed anchor makes each pipelined step cheaper by removing the recurring rescale.
 
-Rather than check scores, we check the running sum once per block: it includes every exponentiated score, so a small sum proves no score crossed the line. A block that fails sets a flag in scalar memory and is replayed with the rescaling softmax. We have seen the literature does something similar before:  Tokamax Splash Attention (`sa`) [29] exposes a related fixed-anchor path through `max_logit_const`: the caller supplies one constant, and the kernel uses it in place of the running maximum for every row. That moves the burden to the user, who must know a safe bound for the model's logits before the call.
+For GDN, $\mathbf{A}\_{kk}$, $\mathbf{A}\_{qk}$, and $\mathbf{U}^{-1}$ are chunk-local. The computations of $\mathbf{V}\_{\mathrm{new}}$, $\mathbf{O}$, and the state increment use the incoming $\mathbf{S}$. Interleaving across these two groups fills gaps while preserving the order of recurrent state updates.
 
-Our static anchor differs on each point. The anchor is chosen inside the kernel from the first fragment's maximum, so the caller supplies nothing and no offline calibration is needed. The kernel then verifies its own guess: after each block it checks that the running denominator stays within the FP32 budget, raises a flag in SMEM if the check fails, and replays that row block with the standard online softmax. The result is therefore exact for any input, and the fast path is taken whenever the check passes, which in practice is nearly always. Appendix A gives the failure analysis. With scores kept in log2 units, every exp is an exp2 with no per-score multiply. The static anchor alone is worth 25–40% of forward throughput at head dimension 256.
+</details>
 
-**A pipeline across fragments.** TPU compilers can overlap some vector and matrix work, but we found that relying on instruction scheduling alone leaves the available overlap constrained by the structure exposed by the kernel. `rpa_v3` explicitly writes the schedule by hand: it interleaves one KV head's QK-plus-softmax with the previous head's PV. The limitation is that the pipeline depth is therefore tied to the number of KV heads resident on each chip. Under GQA with high tensor parallelism, this can collapse to a single head, leaving no head-level work to overlap. Moreover, the pipeline sits inside a runtime loop over KV chunks, so it drains and refills at every chunk boundary. 
+The changes work together. Layout gives each operand more useful work; the reformulations remove vector bottlenecks; the pipeline overlaps the dependencies that remain. With online softmax and no fragment pipeline, the ablation reaches 353 TFLOP/s. With both the checked anchor and the pipeline, it reaches 722 TFLOP/s.
 
-We move the overlap down to the KV fragments within a head: each fragment's QK and exp2 are emitted right next to the previous fragment's PV, fully unrolled, spanning every fragment of every head in the block:
+## Additional Implementation Details
 
-```python
-probs = softmax(qk(frag[0]))
-for i in range(1, num_fragments):       # fully unrolled
-    next_probs = softmax(qk(frag[i]))   # MXU: QK of i, VPU/EUP: exp2 of i
-    pv(frag[i - 1], probs)              # MXU: PV of i - 1
-    probs = next_probs
-pv(frag[-1], probs)
-```
+The main techniques set the direction. Making them work inside a model also requires handling ragged batches, preprocessing, and the TPU's tile geometry. We collect those details here so they do not interrupt the argument above.
 
-The pipeline also keeps the MXU's push queue full: the next fragment's push is issued while the previous fragment's result is still draining.
+<details markdown="1" id="layout-details">
+<summary>Ragged Boundaries and Projection Layouts</summary>
 
-### 3.2 Gated DeltaNet
+A dense per-head tile is convenient for the MXU, but ragged sequences can begin at arbitrary token positions. On v6e, the DMA window follows an 8-row alignment. Flywheel snaps the start down to the aligned row. Before writing, it restores any preceding sequence's output rows from the previous buffer in on-chip vector memory (VMEM). Figure 1b shows a sequence beginning at row 13 whose window starts at row 8. Rows 8–12 are copied back before the DMA, avoiding a separate HBM gather.
 
-**Native layout in, packed output out.** The layout constraint costs `gdn_v3` more than it costs `rpa_v3`. `gdn_v3` wants `[T, 1, dim]` in FP32 so the convolution's 4-token shift is register naming; producing it costs an XLA retile and upcast. We take the qkv projection in the caller's `[T, dim]` BF16 layout, cast on chip, and write packed output with the same 8-row snapping and copy as the softmax kernel.
+For softmax, projections produce and consume the head-major layout directly. The logical input shapes are $\mathbf{Q}\in\mathbb{R}^{T\times H\_q\times D}$ and $\mathbf{K},\mathbf{V}\in\mathbb{R}^{T\times H\_{kv}\times D}$; the kernel organizes each head as a dense token-by-channel tile.
 
-**Vector work onto the MXU.** Three things in the GDN kernel will saturate the vector units, and this is where the narrow vector side costs GDN the most: the triangular solve, the convolution and the activations. In Flywheel, we move entirely these vector work onto the MXU with transformation below.
+GDN-v3's wrapper requires FP32 inputs in `[T, 1, dim]` layout, adding upcasting and retiling. Flywheel consumes the projection's `[T, dim]` BF16 output and returns packed output for the next projection. Its kernel transposes $\mathbf{K}$ once and reuses it in the shared-operand products. Packing two 128-wide heads into a 256-wide matrix operand also increases the work done per load.
 
-![gdn_tinv.png]({{ '/assets/posts/2026-09-20-attention-tpu/gdn_tinv.png' | relative_url }})
+</details>
 
-**Figure 3.** Triangular inverse as 8 BF16 matmuls, built bottom-up from the 4×4 diagonal blocks of one 64-token chunk.
+<details markdown="1" id="gdn-preprocessing">
+<summary>Convolution and Vector Operations</summary>
 
-*The triangular inverse.* `gdn_v3` inverts $I + A_{kk}$ by forward substitution on the VPU, 64 dependent steps per chunk. Since a strictly lower-triangular $L$ has $L^{64} = 0$, the inverse is a product of matmuls, $(I - L)(I + L^2)\cdots(I + L^{32})$ [9]. On the whole chunk this will lead to incorrect results: with repeated keys the powers hold binomial sums near $10^{17}$ that cancel only at the end. Flywheel inverts the $4 \times 4$ diagonal blocks first, where the worst intermediate is 2, then merge four at a time with the same expansion at block level, 4 → 16 → 64 (Figure 3):
+GDN applies a four-tap causal convolution before the recurrence. With tokens on sublanes, shifting by one token requires vector rearrangement. Flywheel instead stacks tap-scaled inputs and multiplies by a constant selector matrix, as in Figure 2b:
 
 $$
-T = D + E, \qquad T^{-1} = D^{-1}(I - N)(I + N^2), \qquad N = E D^{-1},\ N^4 = 0
+\mathbf{Y}=\mathbf{S}_{\mathrm{conv}}\mathbf{W}.
 $$
 
-Every intermediate stays bounded like the inverse itself, so all 8 matmuls run in BF16 with a max error of $9 \times 10^{-3}$ on repeated keys. We note that [Tokamax's KDA](https://github.com/openxla/tokamax/tree/61311e6/tokamax/_src/ops/experimental/kda) kernel already replaces this serial solve with a matrix-multiplication formulation based on the nilpotence of the strictly lower-triangular part. The main contribution here with Flywheel is therefore not the math, but **how the inverse is decomposed to make that algebra numerically viable in BF16**.
+For $\mathbf{X}\in\mathbb{R}^{C\times128}$ and $k$ taps, $\mathbf{W}\in\mathbb{R}^{kC\times128}$ contains the tap-scaled inputs and the preceding chunk's halo. The selector $\mathbf{S}\_{\mathrm{conv}}\in\{0,1\}^{C\times kC}$ picks and sums the required rows. It is labeled $\mathbf{S}$ in the figure, but is distinct from the recurrent state. For $k=4$ and $C=64$, the contraction dimension is 256. This trades extra matrix arithmetic for fewer vector shifts and accumulations.
 
-![gdn_conv.png]({{ '/assets/posts/2026-09-20-attention-tpu/gdn_conv.png' | relative_url }})
-
-**Figure 4.** 4-tap causal convolution as one matmul against a constant 0/1 selector.
-
-*The convolution.* GDN applies a short causal convolution (4 taps) along the token axis before the recurrence. With tokens on sublanes, shifting the sequence by one token is a sublane rotate followed by a select, and the four shifts add up to about 8K vector operations per tile, all on the units that are already the bottleneck. We move this work to the MXU instead. A causal convolution is a matrix multiply by a banded matrix, so we write the four shifted copies as one stacked operand, scale each copy by its tap weight, and multiply by a constant 0/1 selector matrix built at compile time that picks out the right row from each copy (Figure 4). The MXU's FP32 accumulator does the sum. This costs 64× the FLOPs of the direct convolution, but they run on a unit that was idle, and the vector work disappears entirely.
-
-*Activations.* Two elementwise functions in GDN each need two transcendental evaluations when written the obvious way. We rewrite them so each needs one: silu as $0.5\,x\,(1 + \tanh(x/2))$, which uses one tanh instead of an exp and a divide, and l2norm as $x \cdot \text{rsqrt}(\sum x^2)$, which uses one rsqrt instead of a sqrt and a divide. Each saves one EUP push per element, about 4% per tile.
-
-**Push each weight once.** With the inverse and the convolution moved onto the MXU, the MXU itself became the bottleneck. So we reduced the number of pushes in three ways.
-
-- *Share K across two matmuls.* Both $A_{kk} = K K^\top$ and $A_{qk} = Q K^\top$ use $K^\top$ as the weight. We transpose K once per head group on the XLU, stack Q under K as one left-hand operand $[K;\,Q]$, and compute both products with a single push of $K^\top$. The transpose is done in FP32 on purpose: in BF16, Mosaic recognizes the pattern and folds it back into a transposed push, which costs about twice as much as a normal one.
-- *Share $V_\text{new}$ the same way.* The output and the state update both multiply by $V_\text{new}$, so they share one push.
-- *Two heads per push.* A head's weight is 128 wide and the v6e MXU is 256 wide, so we place two heads side by side as a block-diagonal weight and stream both heads' inputs through one push.
-
-![gdn_gapfill.png]({{ '/assets/posts/2026-09-20-attention-tpu/gdn_gapfill.png' | relative_url }})
-
-**Figure 5.** Filling the inverse's MXU gaps in one 128-token tile of two chunks; the 8 dependent inverse matmuls are about 200 cycles apart.
-
-**Fill the gaps.** After the push count came down, the remaining waste was latency. Each MXU matmul takes about 200 cycles to return its result, and the inverse is a chain of 8 matmuls where each one needs the previous result before it can start, so the MXU sits idle for most of that chain. On a GPU the hardware scheduler would fill those idle cycles with work from other warps; on TPU nothing does this for us (constraint 4), so the kernel has to interleave the work itself.
-
-The idle cycles are filled with matmuls from neighboring chunks that do not depend on the inverse in progress. A tile holds two chunks. While the first chunk's inverse runs, we issue the second chunk's $A_{kk}$ and $A_{qk}$, which need only that chunk's K and Q. While the second chunk's inverse runs, we issue the first chunk's triangular solves, output and state update, whose inverse is already complete. In code this is a callback attached to each matmul of the inverse chain: after the matmul is emitted, the callback emits one independent matmul, so each independent operation lands two positions behind the inputs it needs (Figure 5). 
-
-## 4. Results
-
-We measure the Flywheel kernels at two levels: kernel-level speedup against the production kernels in isolation, and engine-level speedup inside vLLM’s `tpu-inference` ([commit `4420cae`](https://github.com/vllm-project/tpu-inference/tree/4420cae)) on long-context applications, including needle-in-a-haystack retrieval, multi-hop reasoning over long documents, and video understanding. All runs are on TPU v6e. Each v6e chip has one TensorCore with two 256×256 MXUs and a BF16 peak of 918 TFLOP/s; kernel-level numbers use one chip, and engine-level numbers use a v6e-8 at TP8 for contexts up to 256K and a v6e-16 at TP8 with prefill context parallelism 2 at 512K.
-
-### 4.1 Kernel level
-
-![image.png]({{ '/assets/posts/2026-09-20-attention-tpu/softmax-throughput.png' | relative_url }})
-
-**Figure 6.** Softmax attention forward throughput at head dimension 256 on one v6e chip: MHA (top) and GQA with 8 query heads per KV head (bottom). The numbers under each length are our speedup over `rpa_v3` (grey) and `sa` (orange).
-
-Figure 6 runs the forward at head dimension 256, causal, batch 1 on one v6e chip, with 32 query heads and either 32 KV heads (MHA) or 4 (GQA, 8 query heads per KV head), and times the attention kernel alone. Under MHA ours reaches 693 TFLOP/s at 16K and 744 TFLOP/s at 128K, 81% of the chip's BF16 peak. Against `rpa_v3` with its tuned block sizes it is $2.4\text{–}3.5\times$ faster under MHA and $1.3\text{–}1.7\times$ under GQA. Against `sa`, whose block sizes are tuned per sequence length, it is $1.1\text{–}1.6\times$ faster from 2K on, and the gap narrows as sequences grow; at 1K under MHA `sa` is 15% faster. Our throughput barely depends on the number of KV heads: from 8K on, MHA and GQA are within about 1% of each other, and `sa` behaves the same way. `rpa_v3` is the opposite. It keeps heads on sublanes, so its blocks shrink as KV heads are added, and at 128K it drops from 490 TFLOP/s with 4 KV heads to 228 with 32. These are kernel-only timings, which if anything favour `rpa_v3`: its input shape needs extra layout work before the kernel runs, and Appendix B measures that on the whole attention block.
-
-For GDN prefill we time the whole `fused_conv1d_gdn` call on v6e including XLA glue, with BF16 `qkv`, 16 query/key heads, head dimension 128, and 1 or 8 equal-length sequences packed into one call (Figure 7).
-
-![gdn_benchmark.png]({{ '/assets/posts/2026-09-20-attention-tpu/gdn_benchmark.png' | relative_url }})
-
-**Figure 7.** Fused conv1d + GDN prefill on one v6e chip, 16 q/k heads, head_dim 128, T tokens
-packed into 1 or 8 sequences. The row under each T is our speedup over `gdn_v3`.
-
-The speedup is 1.8–2.2× at 1K tokens, 2.5–3.1× at 4K and 2.9–3.6× from 8K on. At 8K the largest single steps were the native layout (about 1.4×), the MXU inverse (1.21×), the convolution on the MXU (20% per tile) and the packed output (14%).
-
-### 4.2 Application level
-
-Kernel speedups do not always survive a serving stack, so we ran both kernels inside `tpu-inference` ([commit `4420cae`](https://github.com/vllm-project/tpu-inference/tree/4420cae)) on a model that exercises both. Qwen3.8-27B interleaves GDN layers with softmax attention at roughly 3:1. Its softmax layers use head dimension 256 with 24 query heads and 4 KV heads; its GDN layers have 48 value heads. We swap in both of our kernels and change nothing else. Runs up to 256K use a v6e-8 at TP8; the 512K run uses a v6e-16 at TP8 with prefill context parallelism 2.
-
-![ruler_throughput.png]({{ '/assets/posts/2026-09-20-attention-tpu/ruler_throughput.png' | relative_url }})
-
-![babilong_throughput.png]({{ '/assets/posts/2026-09-20-attention-tpu/babilong_throughput.png' | relative_url }})
-
-**Figure 8.** Prefill throughput of Qwen3.8-27B in vLLM, baseline vs ours: RULER (top) and BABILong (bottom).
-
-Figure 8 shows the results. On RULER's needle-in-a-haystack tasks both backends score 100% at every length. Prefill throughput is 1.07× at 4K, 1.23× at 128K and 1.53× at 512K. BABILong at 128K, 256K and 512K shows 1.22×, 1.29× and 1.56×, with average accuracy within two points of the baseline at every length.
-
-Why are the end-to-end gains smaller than the kernel gains, and why do they grow with context? This can be explained by the *Amdahl's law*. At 4K most of a prefill step goes to the projections and the MLP, and attention is a small slice of it. As the context grows, softmax attention grows quadratically and takes over the step. Video-MME shows the split directly below.
-
-![videomme_ttft.png]({{ '/assets/posts/2026-09-20-attention-tpu/videomme_ttft.png' | relative_url }})
-
-**Figure 9.** Video-MME time to first token on long videos, split into ViT encoder, LLM prefill and other.
-
-On long videos, the LLM prefill segment gets 1.24× faster at 1024 frames (4.80 s to 3.87 s) and 1.29× at 2048 frames (11.61 s to 9.00 s). The vision encoder and everything else change little, so time to first token improves 1.18× and 1.22×. Accuracy is unchanged: 71.5 vs 71.7 at 1024 frames, 70.6 vs 70.6 at 2048.
-
-## 5. Limitations and what's next
-
-**What the kernels do not cover yet**
-
-- GDN decode and speculative verification still run `gdn_v3`'s token-recurrent math. Only their I/O moved to the native layout.
-- Softmax attention decode is at parity with `rpa_v3`, not ahead of it. At decode the KV read is the bound either way, and the layout and pipeline work of Section 3 buys little there.
-- Hybrid models with MLA layers, such as Ling-3.0, only benefit in their linear-attention layers. The MLA layers are untouched and dominate the step at long context, which is why the speedup on that model falls from 1.8× at 1K tokens to 1.05× at 64K.
-
-**Hardware and scale**
-
-- Everything so far is on v6e. Our v7x tuning is in progress; its 16×256 vector registers and 256×256 MXUs change the tile geometry in Section 2, but we expect the layout decisions to carry over.
-- Context parallelism currently uses a naive all-gather. At 8K tokens the gather dominates and the kernel cannot help; we will explore other alternatives like a ring-style schedule next.
-
-## 6. Acknowledgement
-
-This work was supported by a 2026 Google TPU Research Award. We gratefully acknowledge Google for its generous support, with special thanks to the TPU Builders Program. We would also like to extend our sincere thanks to Josh Gordon, Lauren Jensen, and Karan Bal for their support throughout the project.
-
-## Appendix A: Why the static anchor is safe
-
-**Setup.** Fix one query row. Let $s_1, \ldots, s_N$ be its scores against the $N$ keys it attends to, in natural-log units (the kernel works in log2 units, which rescales every exponent below by the same constant). Let $a$ be the row's anchor, the largest score in its first fragment, so $a$ is itself one of the $s_j$. The fast path computes
+SiLU and query/key normalization each use one specialized-unit operation (`tanh` and `rsqrt`, respectively), alongside the arithmetic and reduction shown below:
 
 $$
-p_j = e^{s_j - a}, \qquad l = \sum_j p_j, \qquad o = \sum_j p_j v_j
+\begin{aligned}
+\operatorname{SiLU}(x)&=\frac{x}{2}(1+\tanh(x/2)),\\
+\frac{\mathbf{x}}{\sqrt{\|\mathbf{x}\|_2^2+\epsilon}}
+&=\mathbf{x}\,\operatorname{rsqrt}\!\left(\textstyle\sum_j x_j^2+\epsilon\right).
+\end{aligned}
 $$
 
-accumulated in FP32, whose largest finite value is about $e^{88.7}$. Assume every entry of every $v_j$ has magnitude at most $V_{\max}$; the kernel budgets $V_{\max} = 2^{12}$. Define
+The normalization uses $\epsilon=10^{-6}$. The paper measures these changes together with the inverse and convolution reformulations in the reduced-vector-work ablation, rather than attributing a standalone speedup to each one.
 
-$$
-\tau = 88.7 - \ln N - \ln V_{\max} - \delta
-$$
+</details>
 
-with a safety margin $\delta > 0$; the kernel uses $\delta = 2$ nats and refuses any configuration where $\tau < 20$ nats.
+<details markdown="1" id="tile-details">
+<summary>Exponential Evaluation and Tile Sizes</summary>
 
-**Claim 1 (no overflow).** If $s_j - a \le \tau$ for every $j$, then $l$ and every entry of $o$ stay below $e^{88.7 - \delta}$ throughout the accumulation.
+The softmax equations above use natural exponentials, matching the paper. The implementation uses `exp2`: it folds $\log\_2 e$ and the attention scale into $\mathbf{Q}$ before the fragment loop, so no per-score conversion is needed there. Anchors and score margins are converted consistently.
 
-*Proof.* Each $p_j \le e^\tau$, so every partial sum of $l$ is at most $N e^\tau = e^{88.7 - \ln V_{\max} - \delta} < e^{88.7 - \delta}$. Every entry of every partial sum of $o$ is at most $\sum_j p_j \lvert v_j \rvert \le V_{\max} \cdot l \le N e^\tau V_{\max} = e^{88.7 - \delta}$. ∎
+A 2048×2048 softmax block contains 32 fragments of 256 query rows and 512 key rows. The loop is unrolled into one compiler basic block. When a block contains multiple heads, the last output product of one head overlaps the first score product of the next.
 
-For $N = 512\text{K}$ and $V_{\max} = 2^{12}$, $\tau$ is about 65 nats: a later score would have to exceed the first fragment's max by a factor of $e^{65} \approx 10^{28}$ in unnormalized probability before anything could overflow. Scores far below the anchor are harmless: their $p_j$ underflow to zero, as in standard softmax, and because $a$ is itself one of the scores, $l \ge 1$, so the final $o / l$ never divides by a vanishing sum.
+GDN uses 128-row tiles containing two 64-token chunks when they fit. On one v7x TensorCore, the 48-value-head case only fits a single chunk per tile in its 64 MiB of VMEM. That prevents the cross-chunk pipeline, a limitation visible in the results below.
 
-**Claim 2 (the check never misses).** After a row finishes a KV block, the kernel tests $l \le e^\tau$. If the test passes, every score seen so far satisfies $s_j - a \le \tau$.
+</details>
 
-*Proof.* Every $p_j$ is non-negative, so $l \ge p_j = e^{s_j - a}$ for each $j$. Hence $l \le e^\tau$ implies $s_j - a \le \tau$ for all $j$. ∎
+## Evaluation
 
-Equivalently, any score more than $\tau$ above the anchor forces $l > e^\tau$, even if $l$ has overflowed to infinity, so a block containing such a score always fails the test. The converse does not hold: $l$ can exceed $e^\tau$ through many moderate terms. That only costs an unnecessary replay, and since $l \le N \cdot \max_j p_j$, it requires some score more than $\tau - \ln N$ above the anchor, about 52 nats at $N = 512\text{K}$.
 
-**Recovery.** The kernel keeps a row's $l$ and $o$ from before each KV block (they are double-buffered across blocks), so a block that fails the test is recomputed from that saved state with the standard rescaling softmax, which moves the anchor from $a$ to the new maximum $a'$ and rescales $l$ and $o$ by $e^{a - a'}$.
+We measure the Flywheel kernels at two levels: kernel-level speedup in isolation, and engine-level speedup inside vLLM’s `tpu-inference` on long-context applications, including needle-in-a-haystack retrieval, multi-hop reasoning over long documents, and video understanding.
 
-## Appendix B: Comparing against RPA on the whole attention block
+Kernel measurements use one v6e chip or one v7x TensorCore. Their BF16 peaks are 918 and 1153 TFLOP/s, respectively. A v7x chip has two TensorCores, so these are not whole-chip comparisons across generations.
 
-Figure 6 compares the attention kernels alone. That is fair for ours and `sa` but not for `rpa_v3`, because the three take different input shapes: ours takes [B, H, T, d], `sa` takes [H, T, d], and `rpa_v3` reads from its paged KV cache. A kernel-only timing leaves whatever it costs to produce that shape outside the clock. For ours and `sa` that cost is essentially zero: each needs only a rearrangement of the projection's output, and XLA folds that rearrangement into the projection itself. `rpa_v3` needs more than a rearrangement. Its cache stores K and V together, so the inputs have to be concatenated and transposed into that layout before the kernel runs. These operations build new tensors, which XLA cannot fold away. Figure B1 therefore times the whole attention block, from hidden states to hidden states with d_model = 8192, so that both projections and every layout conversion are inside the clock, and splits each bar by where the time goes.
+<details markdown="1" id="benchmark-setup">
+<summary>Evaluation Setup</summary>
 
-![image.png]({{ '/assets/posts/2026-09-20-attention-tpu/attention-block-time.png' | relative_url }})
+The kernel benchmarks use one v6e chip (918 TFLOP/s BF16 peak, 128 MiB VMEM) or one v7x TensorCore (1153 TFLOP/s, 64 MiB VMEM). A v7x chip contains two TensorCores. These comparisons use JAX 0.11.0 and libtpu 0.0.44, with the baseline commits specified near the start of the post.
 
-**Figure B1.** Attention block time on one v6e chip, from hidden states to hidden states, split into the qkv projection, layout, attention kernel and output projection, `rpa_v3` vs ours: MHA (top) and GQA with 8 query heads per KV head (bottom).
+Softmax prefill is causal and BF16, with batch size 1, head dimension $D=256$, $H\_q=32$, and $H\_{kv}=32$ (MHA) or 4 (GQA), from 1K to 128K tokens. Kernel throughput divides analytic FLOPs by device time from a profiler trace. The roofline assumes one read of each input and one output write. Full attention blocks include projections and layout work and use wall-clock time.
 
-The layout segment appears only on `rpa_v3`: under MHA it costs 0.28 ms at 1K and 33.9 ms at 128K, and under GQA it is 45% of `rpa_v3`'s block at 1K. Ours has none, because the arrangement our kernel needs is absorbed by the projection. Where the gap comes from shifts with sequence length. At 1K, 60% of the MHA gap is `rpa_v3`'s  layout; from 16K on, most of it is the kernel, 75% at 16K and 95% at 128K. End to end, ours finishes a 128K MHA block in 472 ms against 1,373 ms for `rpa_v3`, 2.9× faster. The ratio grows from 1.6× at 1K because attention grows quadratically with sequence length while the projections grow only linearly: at 1K attention is 3% of the block's FLOPs, at 128K it is 80%. Under GQA the ratio stays between 1.4× and 1.8×.
+GDN benchmarks time the complete fused convolution and prefill call, including wrapper operations, with 16 query/key heads, $d\_k=d\_v=128$, and $n\_v\in\{16,32,48\}$ value heads. Activations are BF16 and the recurrent state is FP32. Calls contain one or eight equal-length sequences. Kernel times are medians over five rounds of back-to-back calls.
+
+Application runs serve Qwen3.8-27B in vLLM. The v6e setup uses eight chips with eight-way tensor parallelism through 256K tokens, and sixteen chips with eight-way tensor parallelism and two-way prefill context parallelism at 512K. The v7x runs use four chips (eight TensorCores) with eight-way tensor parallelism throughout. Ratios compare the kernels within each setup.
+
+For RULER and BABILong, prefill throughput is prompt tokens divided by generation wall time. Video-MME reports the mean language-model prefill time per question. The v7x evaluation uses 20 samples per RULER/BABILong task and eight Video-MME questions; v6e Video-MME evaluates 674 questions. At 512K tokens, and on v7x also at 256K, the paper extends RoPE with YaRN at factor 2.
+
+</details>
+
+### Kernel Performance
+
+<figure>
+  <a href="{{ '/assets/posts/2026-09-20-attention-tpu/paper/softmax_kernel.pdf' | relative_url }}"><img src="{{ '/assets/posts/2026-09-20-attention-tpu/paper/softmax_kernel.png' | relative_url }}" alt="Softmax attention throughput on v6e and v7x for MHA and GQA." width="1800" height="850" loading="lazy"></a>
+  <figcaption>Figure 4. Softmax attention forward throughput at head dimension 256: one v6e chip (top) and one v7x TensorCore (bottom), under MHA (32 query / 32 KV heads) and GQA (32 / 4). Ratios beneath each length compare Flywheel with RPA-v3 and Splash.</figcaption>
+</figure>
+
+Figure 4 measures causal attention forward passes at head dimension 256 and batch size 1, with 32 query heads and either 32 KV heads (MHA) or 4 (GQA). It times the attention kernel alone. On v6e, Flywheel reaches 744 TFLOP/s, 81% of peak BF16 throughput. From 2K to 128K tokens, it is 3.11–3.49× faster than RPA-v3 under MHA and 1.50–1.73× under GQA. Against Splash Attention, it is 1.10–1.56× faster over the same range. On v7x, the corresponding gains are 3.57–4.14× under MHA and 1.57–1.66× under GQA over RPA-v3, and 1.18–1.80× over Splash Attention.
+
+Our throughput barely depends on the number of KV heads: from 8K on, MHA and GQA differ by at most 1.2%, and Splash Attention behaves similarly. RPA-v3 is the opposite. It keeps heads on sublanes, so its blocks shrink as KV heads are added; under MHA, padding also leaves half its BF16 rows unused. This is where the layout choice shows up in the measurements.
+
+The gain is not limited to these two shapes. Across 792 v6e configurations varying batch size, head count, KV head count and head dimension, Flywheel beats both baselines in 785, with a median speedup of 1.30× over the faster baseline. The seven exceptions are at 1K tokens and head dimension 256, where it stays within 9% of Splash. These are kernel-only timings; the full-block comparison below includes the projections and layout work around them.
+
+For GDN prefill we time the whole fused convolution and recurrence, including the wrapper’s data preparation (Figure 5).
+
+<figure>
+  <a href="{{ '/assets/posts/2026-09-20-attention-tpu/paper/gdn_kernel.pdf' | relative_url }}"><img src="{{ '/assets/posts/2026-09-20-attention-tpu/paper/gdn_kernel.png' | relative_url }}" alt="Throughput of fused causal convolution and GDN prefill on v6e and v7x." width="1800" height="889" loading="lazy"></a>
+  <figcaption>Figure 5. Fused conv1d + GDN prefill: 16 query/key heads, head dimension 128, and 16, 32, or 48 value heads. Tokens are packed into one or eight sequences. The ratios compare Flywheel with GDN-v3 on the same device.</figcaption>
+</figure>
+
+On v6e the speedup is 1.84–2.25× at 1K tokens, 2.45–3.10× at 4K and 2.88–3.61× from 8K on. With 48 value heads, Flywheel processes 9.9M tokens/s at 16K against 3.0M for GDN-v3. The incremental 8K-token ablation gives 1.52–1.68× from coordinated layouts, then 1.06–1.22× from operand reuse, 1.51–1.58× from reduced vector work, and 1.13–1.25× from pipelining. These are successive gains, not standalone speedups.
+
+On one v7x TensorCore, Flywheel is 1.56–2.62× faster than GDN-v3. Its 64 MiB of VMEM also exposes a limit: at 48 value heads only one 64-token chunk fits per tile, preventing cross-chunk pipelining. More compute and bandwidth do not remove the need for enough on-chip space to keep independent work in flight.
+
+### End-to-End Application
+
+Kernel speedups do not always survive a serving stack, so we ran the kernels inside vLLM on a model that exercises both. Qwen3.8-27B interleaves 48 GDN layers with 16 softmax attention layers. Flywheel replaces the baseline softmax, GDN and vision-encoder attention kernels within the same build; the model, scheduler and other operators stay fixed.
+
+<figure>
+  <a href="{{ '/assets/posts/2026-09-20-attention-tpu/paper/e2e_split.pdf' | relative_url }}"><img src="{{ '/assets/posts/2026-09-20-attention-tpu/paper/e2e_split.png' | relative_url }}" alt="Qwen3.8-27B application results on RULER, BABILong and Video-MME for v6e and v7x." width="1800" height="870" loading="lazy"></a>
+  <figcaption>Figure 6. Qwen3.8-27B in vLLM on v6e (top) and v7x (bottom). RULER and BABILong report prompt tokens divided by generation wall time; Video-MME reports language-model prefill time. The v7x evaluation uses 20 samples per RULER/BABILong task and eight Video-MME questions.</figcaption>
+</figure>
+
+Figure 6 shows the results on both generations. On v6e, both backends score 100% on RULER's evaluated needle-in-a-haystack tasks at every length. Prefill throughput improves by 1.07× at 4K, 1.23× at 128K and 1.53× at 512K. BABILong at 128K, 256K and 512K shows 1.22×, 1.29× and 1.56×, with identical accuracy scores for the two backends. On v7x, both text workloads reach 1.35× speedup at 512K; RULER is slightly slower at 4K (0.98×), where attention is a much smaller share of the work.
+
+Why are the end-to-end gains smaller than the kernel gains, and why do they grow with context? Amdahl's law explains the difference. At 4K most of a prefill step goes to the projections and the MLP, and attention is a small slice of it. As the context grows, softmax attention grows quadratically and takes over the step. The Video-MME panels show the same effect on prompts with roughly 113K and 225K visual tokens.
+
+On long videos, the v6e LLM prefill segment gets 1.24× faster at 1024 frames (4.80 s to 3.87 s) and 1.29× at 2048 frames (11.60 s to 9.00 s). On v7x the corresponding gains are 1.15× and 1.24×. These are language-model prefill times, not total video processing time.
+
+Accuracy remains comparable on the evaluated workloads. On v6e, Video-MME scores are identical at 2048 frames and differ by one of 674 questions at 1024 frames. On the smaller v7x evaluation, both runs give identical Video-MME answers; mean RULER scores differ by at most 0.8 points, and BABILong scores match at 128K and 256K and differ by one point at 512K.
+
+### Softmax Attention Block Time
+
+Kernel-only timings exclude the cost of preparing inputs and consuming outputs. We also measure from hidden states to hidden states, including the projections and all layout conversions. Under MHA on v6e, Flywheel is 1.48× faster than RPA-v3 at 1K and 2.95× at 128K. Gains over Splash are smaller because its surrounding projections also avoid separate layout conversions.
+
+<details markdown="1" id="full-block-results">
+<summary>Attention Block Breakdown</summary>
+
+Figure 4 compares the attention kernels alone, but a kernel-only timing leaves the cost of producing its input layout outside the clock. For Flywheel and Splash Attention, the surrounding projections can directly produce and consume the attention layout. RPA-v3 reads from a paged KV cache that interleaves heads, so its block also concatenates and transposes K and V. Figure 7 therefore times the whole attention block, from hidden states to hidden states with $d\_{\mathrm{model}} = 8192$, so both projections and every layout conversion are inside the clock.
+
+<figure>
+  <a href="{{ '/assets/posts/2026-09-20-attention-tpu/paper/softmax_block.pdf' | relative_url }}"><img src="{{ '/assets/posts/2026-09-20-attention-tpu/paper/softmax_block.png' | relative_url }}" alt="Full attention block time split into projections, layout work and the attention kernel." width="1800" height="542" loading="lazy"></a>
+  <figcaption>Figure 7. Attention block time on one v6e chip, with 32 query heads and head dimension 256. R, S and F are RPA-v3, Splash and Flywheel. Bars are split into QKV projection, layout, kernel and output projection, and normalized to the slowest block of each group.</figcaption>
+</figure>
+
+The layout segment appears only on RPA-v3: under MHA it costs 0.25 ms at 1K and 33.7 ms at 128K. The main source of the performance gap changes with sequence length. At 1K, layout work accounts for 65% of the MHA gap; at 128K, the kernel accounts for 96%. Flywheel finishes the 128K MHA block in 466 ms against 1371 ms for RPA-v3, 2.95× faster. The speedup grows from 1.48× at 1K because attention grows quadratically with sequence length while the projections grow only linearly: attention is 3% of the block's FLOPs at 1K and 80% at 128K. Under GQA the speedup is 1.41–1.76×.
+
+Splash also avoids layout conversions, so the full-block gains over it are smaller: 1.01–1.15× from 2K onward. At 1K, where projections account for about 90% of the block, Splash's block is 4% faster.
+
+</details>
+
+
+## Conclusion and Next Steps
+
+The gains are largest in prefill, where there is enough matrix work to amortize operand loads and overlap neighboring fragments or chunks. Short sequences leave less room for either. The v7x GDN case also shows that on-chip capacity can limit which pipeline fits, even on a faster device.
+
+Decode is ongoing work. With only one query token per head, reading the KV cache or recurrent state often dominates the step, so the priorities differ from prefill. We are continuing to develop and benchmark these paths in the [Flywheel codebase](https://github.com/heavyball-research/flywheel-tpu).
+
+We have added TPU support for [ReplaySSM](https://tridao.me/blog/2026/replayssm/), which caches recent inputs alongside a recurrent-state checkpoint instead of writing the full state at every step. Flywheel applies this approach to both GDN and Kimi Delta Attention (KDA), including speculative verification. We encourage readers to read the ReplaySSM team's post for the algorithm and its motivation.
+
+Some milestones in the codebase so far:
+
+- **ReplaySSM for GDN and KDA:** [the initial implementation](https://github.com/heavyball-research/flywheel-tpu/pull/13) adds decode and verification support; [a subsequent update](https://github.com/heavyball-research/flywheel-tpu/pull/21) stores the FP32 checkpoint as high and low 16-bit planes, allowing ordinary decode steps to read only the high plane.
+- **FP8 KV caches:** [FP8 cache support](https://github.com/heavyball-research/flywheel-tpu/pull/22) adds `float8_e4m3fn` and `float8_e5m2` storage, followed by [head-pair fragments and v7x tuning](https://github.com/heavyball-research/flywheel-tpu/pull/30).
+- **Speculative verification:** [short verification windows](https://github.com/heavyball-research/flywheel-tpu/pull/23) share staged key/value blocks by folding the window into the query heads, with [v7x configurations](https://github.com/heavyball-research/flywheel-tpu/pull/33) added for these workloads.
+
+For the current APIs, benchmark instructions, and subsequent improvements, see the [README](https://github.com/heavyball-research/flywheel-tpu#readme) and [release history](https://github.com/heavyball-research/flywheel-tpu/releases). The repository will continue to evolve as this work progresses.
+
+## Acknowledgments
+
+This work was supported by a 2026 Google TPU Research Award and the TPU Builders Program. The authors thank Josh Gordon, Lauren Jensen, Edgar Chen, Satha Kumar, Tasha Allen, Aditi Joshi, and the entire TPU Builders Support Team for their help with TPU onboarding.
 
 ## References
 
 [1] T. Dao, D. Y. Fu, S. Ermon, A. Rudra, C. Ré. FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness. NeurIPS 2022. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135)
+{: #ref-1}
 
 [2] T. Dao. FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning. ICLR 2024. [arXiv:2307.08691](https://arxiv.org/abs/2307.08691)
+{: #ref-2}
 
 [3] J. Shah, G. Bikshandi, Y. Zhang, V. Thakkar, P. Ramani, T. Dao. FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision. NeurIPS 2024. [arXiv:2407.08608](https://arxiv.org/abs/2407.08608)
+{: #ref-3}
 
 [4] T. Zadouri, M. Hoehnerbach, J. Shah, T. Liu, V. Thakkar, T. Dao. FlashAttention-4: Algorithm and Kernel Pipelining Co-Design for Asymmetric Hardware Scaling. 2026. [arXiv:2603.05451](https://arxiv.org/abs/2603.05451)
+{: #ref-4}
 
 [5] K. Hong, G. Dai, J. Xu, Q. Mao, X. Li, J. Liu, K. Chen, Y. Dong, Y. Wang. FlashDecoding++: Faster Large Language Model Inference on GPUs. MLSys 2024. [arXiv:2311.01282](https://arxiv.org/abs/2311.01282)
+{: #ref-5}
 
 [6] Z. Ye et al. FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving. MLSys 2025. [arXiv:2501.01005](https://arxiv.org/abs/2501.01005)
+{: #ref-6}
 
 [7] S. Yang, Y. Zhang. FLA: A Triton-Based Library for Hardware-Efficient Implementations of Linear Attention Mechanism. 2024. [github.com/fla-org/flash-linear-attention](https://github.com/fla-org/flash-linear-attention)
+{: #ref-7}
 
 [8] J. Jiang, Y. Chen, B. A. Hechtman, F. Zhang, Y. Mu. Ragged Paged Attention: A High-Performance and Flexible LLM Inference Kernel for TPU. 2026. [arXiv:2604.15464](https://arxiv.org/abs/2604.15464)
+{: #ref-8}
 
 [9] A. Sobczyk, G. Gottardo, C. K. Matzoros, M. De Vita, F. Skogh, A. Zouzias, J. Zhuang. Fast and Stable Triangular Inversion for Delta-Rule Linear Transformers. 2026. [arXiv:2605.21325](https://arxiv.org/abs/2605.21325)
+{: #ref-9}
 
 [10] S. Yang, J. Kautz, A. Hatamizadeh. Gated Delta Networks: Improving Mamba2 with Delta Rule. ICLR 2025. [arXiv:2412.06464](https://arxiv.org/abs/2412.06464)
+{: #ref-10}
 
 [11] S. Yang, B. Wang, Y. Zhang, Y. Shen, Y. Kim. Parallelizing Linear Transformers with the Delta Rule over Sequence Length. NeurIPS 2024. [arXiv:2406.06484](https://arxiv.org/abs/2406.06484)
+{: #ref-11}
 
 [12] SemiAnalysis. TPU Inference Externalization Full Steam Ahead: InferenceX. September 2026. [newsletter.semianalysis.com](https://newsletter.semianalysis.com/p/tpu-inferencex-full-steam)
+{: #ref-12}
 
 [13] NVIDIA. CUDA Programming Guide 13.1, Compute Capabilities, Table 30. [docs.nvidia.com](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-programming-guide/05-appendices/compute-capabilities.html)
+{: #ref-13}
 
 [14] NVIDIA. NVIDIA H100 Tensor Core GPU Architecture, whitepaper, Tables 1 and 4. 2022. [resources.nvidia.com](https://resources.nvidia.com/en-us-hopper-architecture/nvidia-h100-tensor-c)
+{: #ref-14}
 
 [15] NVIDIA. CUDA C++ Programming Guide 12.8, Compute Capability 9.0 and Hardware Multithreading. [docs.nvidia.com](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-c-programming-guide/index.html#compute-capability-9-0)
+{: #ref-15}
 
 [16] NVIDIA. H100 Tensor Core GPU specifications. [nvidia.com](https://www.nvidia.com/en-us/data-center/h100/)
+{: #ref-16}
 
 [17] NVIDIA. DGX B200 datasheet. [resources.nvidia.com](https://resources.nvidia.com/en-us-dgx-systems/dgx-b200-datasheet)
+{: #ref-17}
 
 [18] NVIDIA. CUDA Programming Guide 13.1, Asynchronous Data Copies (TMA). [docs.nvidia.com](https://docs.nvidia.com/cuda/archive/13.1.0/cuda-programming-guide/04-special-topics/async-copies.html)
+{: #ref-18}
 
 [19] N. P. Jouppi, D. H. Yoon, G. Kurian, S. Li, N. Patil, J. Laudon, C. Young, D. Patterson. A Domain-Specific Supercomputer for Training Deep Neural Networks. Communications of the ACM 63(7), 2020. [doi:10.1145/3360307](https://doi.org/10.1145/3360307)
+{: #ref-19}
 
 [20] N. P. Jouppi, S. Lakshmanamurthy, C. Young, D. Patterson. Google's Training Supercomputers from TPU v2 to Ironwood: Architectural Stability, Scale, Resilience, Power Efficiency, and Sustainability Across Five Generations. IEEE Micro, July/August 2026. [arXiv:2606.15870](https://arxiv.org/abs/2606.15870)
+{: #ref-20}
 
 [21] OpenXLA. Tiled layout. [openxla.org](https://openxla.org/xla/tiled_layout)
+{: #ref-21}
 
 [22] JAX. Writing TPU kernels with Pallas. [docs.jax.dev](https://docs.jax.dev/en/latest/pallas/tpu/details.html)
+{: #ref-22}
 
 [23] Google Cloud. TPU architecture, and the TPU v4, v5e, v5p, v6e and TPU7x pages. [docs.cloud.google.com](https://docs.cloud.google.com/tpu/docs/system-architecture-tpu-vm)
+{: #ref-23}
 
 [24] J. Austin, S. Douglas, R. Frostig, A. Levskaya, C. Chen, S. Vikram, F. Lebron, P. Choy, V. Ramasesh, A. Webson, R. Pope. How to Think About TPUs. In How To Scale Your Model. 2025. [jax-ml.github.io/scaling-book](https://jax-ml.github.io/scaling-book/tpus/)
+{: #ref-24}
 
 [25] P. Toulme. From JAX to VLIW: Tracing a Computation Through the TPU Compiler Stack. December 2025. [patricktoulme.substack.com](https://patricktoulme.substack.com/p/from-jax-to-vliw-tracing-a-computation)
+{: #ref-25}
 
 [26] P. Toulme. When XLA Isn't Enough, with public LLO compiler dumps for TPU v6e. January 2026. [patricktoulme.substack.com](https://patricktoulme.substack.com/p/when-xla-isnt-enough-from-pallas), [github.com/patrick-toulme/justabyte](https://github.com/patrick-toulme/justabyte/tree/main/tpu_pallas_post)
+{: #ref-26}
 
 [27] JAX. Mosaic TPU vector layout passes, `infer_vector_layout.cc` and `apply_vector_layout.cc`, jax-v0.8.0. [github.com/jax-ml/jax](https://github.com/jax-ml/jax/tree/jax-v0.8.0/jaxlib/mosaic/dialect/tpu/transforms)
+{: #ref-27}
 
 [28] NVIDIA. Parallel Thread Execution ISA: warpgroup-level matrix multiply-accumulate (`wgmma`) and TensorCore 5th generation (`tcgen05`) instructions. [docs.nvidia.com](https://docs.nvidia.com/cuda/parallel-thread-execution/)
+{: #ref-28}
 
 [29] OpenXLA. Tokamax: Splash Attention for TPU. [github.com/openxla/tokamax](https://github.com/openxla/tokamax/tree/main/tokamax/_src/ops/experimental/tpu/splash_attention).
+{: #ref-29}
 
 [30] vLLM Project. `gdn_v3`, the Gated DeltaNet kernel in tpu-inference. [github.com/vllm-project/tpu-inference](https://github.com/vllm-project/tpu-inference)
+{: #ref-30}
