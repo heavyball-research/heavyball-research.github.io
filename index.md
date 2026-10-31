@@ -6,7 +6,7 @@ HeavyBall Research is a research group spanning [NYU Shanghai](https://shanghai.
 
 Our mission is to build the next generation of AI systems. We work broadly on efficient modeling, hardware-aware training and inference algorithms, and the systems that bring them together at scale.
 
-**We are [hiring](https://www.yucheng-lu.me/joinus.html)!**
+**We are [hiring]({{ '/openings/' | relative_url }})!**
 
 ## Group Updates
 

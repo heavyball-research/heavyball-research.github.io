@@ -13,6 +13,6 @@ title: People
 - Yufeng Xu
 - Runyu Peng (Coadvisor: [Chen Zhao](https://henryzhao5852.github.io/))
 
-## Visitors
+## Interns
 
-- Zeshen Zhang
+- Zeshen Zhang (MS @ New York University)

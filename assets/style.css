@@ -84,7 +84,7 @@ body {
 .brand img { width: 34px; height: 34px; margin: 0; border-radius: 8px; }
 .brand:hover { color: var(--heading); }
 
-.site-header nav { display: flex; gap: 20px; }
+.site-header nav { display: flex; flex-wrap: wrap; gap: 12px 20px; }
 .site-header nav a {
   color: var(--text);
   text-decoration: none;
