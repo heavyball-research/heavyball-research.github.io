@@ -14,11 +14,13 @@ tldr: "TPU-native attention kernels on v6e and v7x: up to 4.14× faster softmax 
 image: /assets/posts/2026-09-20-attention-tpu/paper/gdn_kernel.png
 thumbnail_large: true
 links:
+  - label: Paper
+    url: https://arxiv.org/abs/2611.01426
   - label: Code
     url: https://github.com/heavyball-research/flywheel-tpu
 ---
 
-> Editor's Note: Updated in October 2026 with figures and results from our paper, including TPU v7x (Ironwood). The [code and benchmarks](https://github.com/heavyball-research/flywheel-tpu) are open source.
+> Editor's Note: Updated in October 2026 with figures and results from [our paper](https://arxiv.org/abs/2611.01426), including TPU v7x (Ironwood). The [code and benchmarks](https://github.com/heavyball-research/flywheel-tpu) are open source.
 
 <nav class="post-toc" aria-labelledby="contents-title" markdown="1">
 <p id="contents-title"><strong>Contents</strong></p>
